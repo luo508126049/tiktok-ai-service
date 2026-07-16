@@ -1,0 +1,19 @@
+# Local Python environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Playwright and local browser state
+data/
+
+# Local logs and editor files
+*.log
+.idea/
+.vscode/
+*.code-workspace
+
+# Local secrets and environment overrides
+.env
+.env.*
+!.env.example
