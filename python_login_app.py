@@ -8,8 +8,9 @@ import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from threading import Lock
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from playwright.sync_api import BrowserContext, Page, sync_playwright
+from history_store import HistoryStore
 
 LOGIN_URL = "https://buyin.jinritemai.com/mpa/account/login"
 PROFILE_DIR = Path(__file__).parent / "data" / "buyin-browser-profile"
@@ -20,7 +21,12 @@ REQUEST_SPEC_FILE = DATA_DIR / "material_list_request.json"
 SKIPPED_FILE = DATA_DIR / "selection_skipped.json"
 NETWORK_CAPTURE_FILE = DATA_DIR / "network_capture.jsonl"
 MATERIAL_PAGES_FILE = DATA_DIR / "material_list_pages.json"
+HISTORY_DATABASE = DATA_DIR / "history.db"
 CAPTURE_NETWORK = os.getenv("CAPTURE_NETWORK") == "1"
+USE_DIRECT_MATERIAL = os.getenv("BUYIN_DIRECT_MATERIAL") == "1"
+
+history_store = HistoryStore(HISTORY_DATABASE)
+history_store.migrate_json_once(DATA_DIR / "selection_results.json")
 
 
 def find_browser() -> str | None:
@@ -75,73 +81,126 @@ state_lock = Lock()
 playwright = None
 context: BrowserContext | None = None
 page: Page | None = None
+browser_headless = False
 
 PAGE = """
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Buyin Login Console</title>
-<style>body{max-width:720px;margin:48px auto;padding:0 20px;font:16px/1.6 system-ui,sans-serif;color:#202124}button{padding:9px 14px;margin-right:8px;cursor:pointer}pre{padding:14px;background:#f5f6f7;white-space:pre-wrap}.note{color:#5f6368}</style>
-</head><body><h1>Buyin Login Console</h1>
-<p class="note">Scan the QR code in the official Chromium window. The session stays in the local browser profile.</p>
-<button onclick="openLogin()">Open login page</button><button onclick="goSelection()">Open selection</button><button onclick="collectSelection()">Collect &gt;=5000</button><a href="/results">View results</a><button onclick="refreshStatus()">Refresh status</button><button onclick="closeBrowser()">Close browser</button>
-<pre id="status">Loading status...</pre>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>选品采集控制台</title>
+<style>
+:root{--navy:#172235;--blue:#2563eb;--bg:#f3f5f8;--line:#e5e7eb;--text:#1f2937;--muted:#6b7280;--green:#16805c;--red:#c2413b}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}.shell{min-height:100vh;display:flex}.side{width:232px;background:var(--navy);color:#dbe5f4;padding:22px 14px;flex:none}.brand{font-size:18px;font-weight:700;color:#fff;padding:0 12px 26px}.brand small{display:block;color:#91a1b8;font-size:11px;font-weight:400;margin-top:4px}.nav-title{padding:12px;font-size:11px;color:#8191a8}.nav-item{display:block;padding:10px 12px;border-radius:5px;color:#c5d2e4;text-decoration:none;margin:3px 0}.nav-item.active,.nav-item:hover{background:#26364e;color:#fff}.main{flex:1;min-width:0}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 34px}.top h1{font-size:18px;margin:0}.user{color:var(--muted);font-size:13px}.content{max-width:1400px;margin:0 auto;padding:28px 34px}.crumb{font-size:13px;color:var(--muted);margin-bottom:20px}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;margin-bottom:22px}.card{background:#fff;border:1px solid var(--line);border-radius:6px;padding:18px 20px}.card-label{color:var(--muted);font-size:13px}.card-value{font-size:26px;font-weight:700;margin-top:7px}.card-sub{font-size:12px;color:var(--muted);margin-top:4px}.panel{background:#fff;border:1px solid var(--line);border-radius:6px;margin-bottom:20px}.panel-head{display:flex;justify-content:space-between;align-items:center;padding:17px 20px;border-bottom:1px solid var(--line)}.panel-head h2{font-size:16px;margin:0}.panel-body{padding:20px}.actions{display:flex;gap:12px;flex-wrap:wrap;align-items:end}.field{display:flex;flex-direction:column;gap:6px;min-width:180px}.field label{font-size:12px;color:var(--muted)}.field input{height:38px;padding:0 11px;border:1px solid #cfd5df;border-radius:4px;font:inherit}.btn{height:38px;border:1px solid #cbd5e1;background:#fff;color:var(--text);padding:0 15px;border-radius:4px;cursor:pointer;font:inherit}.btn:hover{background:#f8fafc}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.btn.danger{color:var(--red)}.btn:disabled{opacity:.55;cursor:wait}.status{display:flex;align-items:center;gap:9px;color:var(--muted)}.dot{width:8px;height:8px;border-radius:50%;background:#9ca3af}.dot.online{background:#20a36b}.status-url{margin-top:10px;color:var(--muted);word-break:break-all;font-size:12px}.note{color:var(--muted);margin:0 0 17px}.modal-backdrop{position:fixed;inset:0;background:rgba(15,23,42,.35);display:none;align-items:center;justify-content:center;padding:20px}.modal-backdrop.show{display:flex}.modal{background:#fff;width:min(420px,100%);border-radius:7px;box-shadow:0 16px 48px rgba(15,23,42,.22);padding:24px}.modal h3{margin:0 0 10px;font-size:17px}.modal p{margin:0;color:var(--muted);white-space:pre-wrap}.modal-foot{text-align:right;margin-top:22px}
+@media(max-width:800px){.side{width:70px;padding:18px 8px}.brand{font-size:0;padding:0 10px 24px}.brand:before{content:"AI";font-size:18px}.brand small,.nav-title{display:none}.nav-item{font-size:0;text-align:center}.nav-item:before{content:"●";font-size:15px}.top{padding:0 18px}.content{padding:20px 16px}.cards{grid-template-columns:1fr}.panel-head{align-items:flex-start;gap:10px;flex-direction:column}}
+</style></head><body><div class="shell"><aside class="side"><div class="brand">选品采集<small>Buyin Data Console</small></div><div class="nav-title">工作台</div><a class="nav-item active" href="/">采集控制台</a><a class="nav-item" href="/results">历史数据</a></aside><main class="main"><header class="top"><h1>选品采集控制台</h1><span class="user">本地业务工具</span></header><section class="content"><div class="crumb">工作台 / 采集控制台</div><div class="cards"><div class="card"><div class="card-label">浏览器会话</div><div class="card-value" id="sessionValue">未连接</div><div class="card-sub" id="sessionSub">等待状态更新</div></div><div class="card"><div class="card-label">历史记录</div><div class="card-value" id="historyValue">-</div><div class="card-sub">SQLite 持久化记录</div></div><div class="card"><div class="card-label">当前页面</div><div class="card-value" id="pageValue">-</div><div class="card-sub" id="pageSub">暂无页面信息</div></div></div><div class="panel"><div class="panel-head"><h2>采集任务</h2><span class="status" id="statusText"><i class="dot" id="statusDot"></i>检查连接状态</span></div><div class="panel-body"><p class="note">先打开登录页完成授权，再进入选品页面。采集结果会追加保存到历史数据库。</p><div class="actions"><div class="field"><label for="collectLimit">本次采集数量</label><input id="collectLimit" type="number" min="1" max="10000" value="90"></div><button class="btn primary" id="collectBtn" onclick="collectSelection()">开始采集</button><button class="btn" onclick="openLogin()">打开登录页</button><button class="btn" onclick="goSelection()">进入选品页</button><button class="btn" onclick="refreshStatus()">刷新状态</button><button class="btn danger" onclick="closeBrowser()">关闭浏览器</button></div><div class="status-url" id="statusUrl"></div></div></div><div class="panel"><div class="panel-head"><h2>快捷入口</h2></div><div class="panel-body"><a class="btn" href="/results">查看历史数据</a></div></div></section></main></div><div class="modal-backdrop" id="modal"><div class="modal"><h3 id="modalTitle">操作结果</h3><p id="modalMessage"></p><div class="modal-foot"><button class="btn primary" onclick="closeModal()">知道了</button></div></div></div>
 <script>
-async function refreshStatus(){const r=await fetch('/status');document.getElementById('status').textContent=JSON.stringify(await r.json(),null,2)}
-async function openLogin(){await fetch('/open-login',{method:'POST'});await refreshStatus()}
-async function goSelection(){const r=await fetch('/go-selection',{method:'POST'});const data=await r.json();if(!data.ok) alert(data.error);await refreshStatus()}
-async function collectSelection(){const r=await fetch('/collect-selection',{method:'POST'});const data=await r.json();alert(data.ok ? `Saved ${data.count} items` : data.error);await refreshStatus()}
-async function closeBrowser(){await fetch('/close',{method:'POST'});await refreshStatus()}
-refreshStatus();setInterval(refreshStatus,3000);
+const $=id=>document.getElementById(id);
+function showModal(title,message){$('modalTitle').textContent=title;$('modalMessage').textContent=message;$('modal').classList.add('show')}
+function closeModal(){$('modal').classList.remove('show')}
+async function action(url,options,title){try{const response=await fetch(url,options);const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.error||'操作失败');showModal(title,data.message||'操作已完成');return data}catch(error){showModal(title+'失败',error.message);return null}finally{await refreshStatus()}}
+async function refreshStatus(){const status=await fetch('/status').then(r=>r.json());$('sessionValue').textContent=status.open?'已连接':'未连接';$('sessionSub').textContent=status.open?'浏览器会话正常':'请打开登录页';$('pageValue').textContent=status.open?(status.title||'已打开'):'-';$('pageSub').textContent=status.open?'当前页面':'暂无页面信息';$('statusDot').classList.toggle('online',!!status.open);$('statusText').innerHTML='<i class="dot '+(status.open?'online':'')+'"></i>'+(status.open?'浏览器已连接':'浏览器未连接');$('statusUrl').textContent=status.url||''}
+async function refreshHistory(){const data=await fetch('/api/history').then(r=>r.json());$('historyValue').textContent=(data.count||0).toLocaleString()}
+async function openLogin(){await action('/open-login',{method:'POST'},'重新扫码登录')}
+async function goSelection(){await action('/go-selection',{method:'POST'},'进入选品页')}
+async function collectSelection(){const button=$('collectBtn');const limit=Number($('collectLimit').value);if(!Number.isInteger(limit)||limit<1||limit>10000){showModal('参数错误','采集数量必须在 1 到 10000 之间');return}button.disabled=true;button.textContent='采集中...';await action('/collect-selection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit})},'采集任务');button.disabled=false;button.textContent='开始采集';await refreshHistory()}
+async function closeBrowser(){await action('/close',{method:'POST'},'关闭浏览器')}
+async function refreshStatusAction(){await refreshStatus();showModal('刷新状态','浏览器状态已更新')}
+document.querySelector('[onclick="refreshStatus()"]')?.addEventListener('click',refreshStatusAction)
+refreshStatus();refreshHistory();setInterval(refreshStatus,5000);
 </script></body></html>
 """
 
 RESULTS_PAGE = """
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Selection results</title>
-<style>
-body{margin:24px;font:14px/1.5 system-ui,sans-serif;color:#202124;background:#f6f7f9}
-a{color:#d7003a}.toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-table{width:100%;border-collapse:collapse;background:#fff}th,td{padding:10px;border-bottom:1px solid #e5e7eb;text-align:left;vertical-align:middle}th{background:#fafafa;position:sticky;top:0}img{width:72px;height:72px;object-fit:cover;border-radius:4px}.muted{color:#6b7280}
-</style></head><body><div class="toolbar"><h1>Captured products</h1><a href="/">Back to console</a></div>
-<table><thead><tr><th>Image</th><th>Product</th><th>Shop</th><th>Monthly sales</th><th>merchant_product_id</th><th>IDs</th></tr></thead><tbody id="rows"></tbody></table>
-<script>
-async function load(){const response=await fetch('/api/results');const items=await response.json();const rows=document.getElementById('rows');
-rows.innerHTML=items.map(item=>`<tr><td>${item.image_url?`<img src="${item.image_url}" loading="lazy">`:''}</td><td>${item.name||''}</td><td>${item.shop_name||''}</td><td>${item.month_sale??''}</td><td>${item.merchant_product_id||''}</td><td><span class="muted">product: ${item.product_id||''}<br>commodity: ${item.commodity_id||''}</span></td></tr>`).join('');}
-load();
-</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>历史数据</title>
+<style>:root{--navy:#172235;--blue:#2563eb;--bg:#f3f5f8;--line:#e5e7eb;--muted:#6b7280}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#1f2937;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}.shell{min-height:100vh;display:flex}.side{width:232px;background:var(--navy);color:#dbe5f4;padding:22px 14px;flex:none}.brand{font-size:18px;font-weight:700;color:#fff;padding:0 12px 26px}.brand small{display:block;color:#91a1b8;font-size:11px;font-weight:400;margin-top:4px}.nav-title{padding:12px;font-size:11px;color:#8191a8}.nav-item{display:block;padding:10px 12px;border-radius:5px;color:#c5d2e4;text-decoration:none;margin:3px 0}.nav-item.active,.nav-item:hover{background:#26364e;color:#fff}.main{flex:1;min-width:0}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:0 34px}.top h1{font-size:18px;margin:0}.content{max-width:1600px;margin:0 auto;padding:28px 34px}.crumb{font-size:13px;color:var(--muted);margin-bottom:20px}.panel{background:#fff;border:1px solid var(--line);border-radius:6px}.panel-head{display:flex;justify-content:space-between;align-items:center;padding:17px 20px;border-bottom:1px solid var(--line)}.panel-head h2{font-size:16px;margin:0}.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.input{height:36px;border:1px solid #cfd5df;border-radius:4px;padding:0 10px;font:inherit}.btn{height:36px;border:1px solid #cbd5e1;background:#fff;padding:0 14px;border-radius:4px;cursor:pointer;font:inherit}.btn.primary{background:var(--blue);border-color:var(--blue);color:#fff}.meta{color:var(--muted);font-size:13px}.table-wrap{overflow:auto}table{width:100%;min-width:1040px;border-collapse:collapse}th,td{padding:12px 16px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{background:#f8fafc;color:#4b5563;font-weight:600;white-space:nowrap}tbody tr:hover{background:#f8fbff}img{width:56px;height:56px;object-fit:cover;border-radius:4px;background:#f3f4f6}.product{max-width:280px;font-weight:600}.sub{color:var(--muted);font-size:12px;margin-top:3px}.score{font-weight:700;color:#111827}.pager{display:flex;justify-content:space-between;align-items:center;padding:14px 20px}.empty{text-align:center;color:var(--muted);padding:60px}.loading{opacity:.55}
+@media(max-width:800px){.side{width:70px;padding:18px 8px}.brand{font-size:0;padding:0 10px 24px}.brand:before{content:"AI";font-size:18px}.brand small,.nav-title{display:none}.nav-item{font-size:0;text-align:center}.nav-item:before{content:"●";font-size:15px}.top{padding:0 18px}.content{padding:20px 16px}.panel-head{align-items:flex-start;gap:10px;flex-direction:column}}
+</style></head><body><div class="shell"><aside class="side"><div class="brand">选品采集<small>Buyin Data Console</small></div><div class="nav-title">工作台</div><a class="nav-item" href="/">采集控制台</a><a class="nav-item active" href="/results">历史数据</a></aside><main class="main"><header class="top"><h1>历史数据</h1><span class="meta">SQLite indexed storage</span></header><section class="content"><div class="crumb">工作台 / 历史数据</div><div class="panel"><div class="panel-head"><h2>商品采集记录</h2><div class="toolbar"><input class="input" id="query" placeholder="搜索商品、店铺或 ID"><button class="btn primary" onclick="search()">查询</button><a class="btn" href="/">返回控制台</a></div></div><div class="panel-head"><span class="meta" id="summary">正在加载...</span><span class="meta">按采集时间倒序</span></div><div class="table-wrap"><table><thead><tr><th>商品</th><th>商品名称</th><th>店铺名称</th><th>店铺分</th><th>月销</th><th>商家商品 ID</th><th>采集时间</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>暂无符合条件的历史数据</div></div><div class="pager"><span class="meta" id="pageInfo"></span><div><button class="btn" id="prev" onclick="turn(-1)">上一页</button><button class="btn" id="next" onclick="turn(1)">下一页</button></div></div></div></section></main></div>
+<script>let offset=0;const size=100;function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function load(){document.body.classList.add('loading');const q=encodeURIComponent(document.getElementById('query').value.trim());const items=await fetch('/api/results?limit='+size+'&offset='+offset+'&q='+q).then(r=>r.json());const rows=document.getElementById('rows');rows.innerHTML=items.map(item=>'<tr><td>'+(item.image_url?'<img src="'+esc(item.image_url)+'" loading="lazy">':'-')+'</td><td><div class="product">'+esc(item.name||'未命名商品')+'</div><div class="sub">商品 ID：'+esc(item.product_id)+'</div></td><td>'+esc(item.shop_name||'未获取到店铺名称')+'<div class="sub">店铺 ID：'+esc(item.shop_id)+'</div></td><td><span class="score">'+esc(item.shop_score||'-')+'</span></td><td>'+esc(item.month_sale||'-')+'</td><td>'+esc(item.merchant_product_id||'-')+'</td><td>'+esc(item.collected_at||'-').replace('T',' ').slice(0,19)+'</td></tr>').join('');document.getElementById('empty').hidden=items.length>0;document.getElementById('summary').textContent='本页 '+items.length+' 条';document.getElementById('pageInfo').textContent='第 '+(Math.floor(offset/size)+1)+' 页';document.getElementById('prev').disabled=offset===0;document.getElementById('next').disabled=items.length<size;document.body.classList.remove('loading')}function search(){offset=0;load()}function turn(direction){offset=Math.max(0,offset+direction*size);load()}load()</script></body></html>
 """
 
 
-def open_login_page() -> None:
-    global playwright, context, page
+def _launch_browser(headless: bool) -> None:
+    global playwright, context, page, browser_headless
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    playwright = sync_playwright().start()
+    options = {
+        "user_data_dir": str(PROFILE_DIR),
+        "headless": headless,
+        "viewport": {"width": 1440, "height": 900},
+        "timeout": 60000,
+    }
+    browser_path = find_browser()
+    if browser_path:
+        options["executable_path"] = browser_path
+    context = playwright.chromium.launch_persistent_context(**options)
+    context.on("console", lambda message: print(f"[browser console] {message.type}: {message.text}"))
+    context.on("requestfailed", lambda request: print(
+        f"[request failed] {request.method} {request.url} :: {request.failure}"
+    ))
+    context.on("response", lambda response: print(
+        f"[response {response.status}] {response.url}"
+    ) if response.status >= 400 else None)
+    if CAPTURE_NETWORK:
+        context.on("response", capture_network_response)
+    page = context.pages[0] if context.pages else context.new_page()
+    browser_headless = headless
+
+
+def _close_browser_context() -> None:
+    global playwright, context, page, browser_headless
+    if context is not None:
+        context.close()
+    if playwright is not None:
+        playwright.stop()
+    playwright = context = page = None
+    browser_headless = False
+
+
+def _open_login_url() -> None:
+    if page is None:
+        raise RuntimeError("The browser page is not available.")
+    page.goto(LOGIN_URL, wait_until="commit", timeout=60000)
+    page.wait_for_load_state("domcontentloaded", timeout=60000)
+    page.wait_for_timeout(8000)
+
+
+def _switch_to_headless_after_login() -> None:
+    """Hide the temporary QR browser after the persistent session becomes valid."""
+    global page
+    if browser_headless or page is None or page.is_closed():
+        return
+    if "buyin.jinritemai.com" not in page.url or "/account/login" in page.url:
+        return
+    current_url = page.url
+    _close_browser_context()
+    _launch_browser(headless=True)
+    page.goto(current_url, wait_until="commit", timeout=60000)
+    page.wait_for_load_state("domcontentloaded", timeout=60000)
+    mark_authenticated(page)
+
+
+def open_login_page(force_visible: bool = False) -> None:
     with state_lock:
+        if force_visible:
+            if context is not None:
+                _close_browser_context()
+            _launch_browser(headless=False)
+            context.clear_cookies()
+            _open_login_url()
+            if "/account/login" not in page.url:
+                try:
+                    page.evaluate("""() => { localStorage.clear(); sessionStorage.clear(); }""")
+                except Exception:
+                    pass
+                context.clear_cookies()
+                _open_login_url()
+            mark_authenticated(page)
+            return
         if context is None:
-            PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-            playwright = sync_playwright().start()
-            options = {
-                "user_data_dir": str(PROFILE_DIR),
-                "headless": AUTH_MARKER.exists() and os.getenv("BUYIN_VISIBLE") != "1",
-                "viewport": {"width": 1440, "height": 900},
-                "timeout": 60000,
-            }
-            browser_path = find_browser()
-            if browser_path:
-                options["executable_path"] = browser_path
-            context = playwright.chromium.launch_persistent_context(**options)
-            context.on("console", lambda message: print(f"[browser console] {message.type}: {message.text}"))
-            context.on("requestfailed", lambda request: print(
-                f"[request failed] {request.method} {request.url} :: {request.failure}"
-            ))
-            context.on("response", lambda response: print(
-                f"[response {response.status}] {response.url}"
-            ) if response.status >= 400 else None)
-            if CAPTURE_NETWORK:
-                context.on("response", capture_network_response)
-        page = context.pages[0] if context.pages else context.new_page()
-        page.goto(LOGIN_URL, wait_until="commit", timeout=60000)
-        page.wait_for_load_state("domcontentloaded", timeout=60000)
-        page.wait_for_timeout(8000)
+            _launch_browser(headless=AUTH_MARKER.exists())
+        _open_login_url()
+        if browser_headless and "/account/login" in page.url:
+            _close_browser_context()
+            _launch_browser(headless=False)
+            _open_login_url()
         mark_authenticated(page)
 
 
@@ -152,7 +211,7 @@ def open_selection_page() -> None:
         if "buyin.jinritemai.com" not in page.url:
             raise RuntimeError("The current page is not the official Buyin site.")
         if "/account/login" in page.url:
-            raise RuntimeError("The saved login session has expired. Restart with BUYIN_VISIBLE=1 and scan again.")
+            raise RuntimeError("The saved login session has expired. Click Open login page and scan the QR code.")
         selection = page.get_by_text("选品", exact=True).first
         selection.wait_for(state="visible", timeout=15000)
         selection.click()
@@ -224,29 +283,45 @@ def direct_material_list(current_page: Page, body_override: dict | None = None) 
 
 
 def collect_material_pages(current_page: Page, first_payload: dict, minimum: int = 90) -> tuple[list, list]:
-    """Fetch pages in the current authenticated browser context."""
-    spec_body = json.loads(REQUEST_SPEC_FILE.read_text(encoding="utf-8")).get("body") or "{}"
-    request_body = json.loads(spec_body)
+    """Fetch the first page and trigger subsequent pages through the live page."""
     pages = [first_payload]
     promotions = list(first_payload.get("data", {}).get("summary_promotions") or [])
     last_payload = first_payload
-    cursor = int(request_body.get("cursor") or 0)
-    size = int(request_body.get("size") or 30)
+    cursor = 0
+    size = 30
 
     while len(promotions) < minimum and last_payload.get("data", {}).get("has_more"):
-        cursor += size
-        request_body["cursor"] = cursor
-        extra = last_payload.get("data", {}).get("extra") or {}
-        if extra.get("search_id"):
-            request_body.setdefault("extra", {})["search_id"] = extra["search_id"]
-        if extra.get("session_id"):
-            request_body.setdefault("extra", {})["session_id"] = extra["session_id"]
-        next_payload = direct_material_list(current_page, request_body)
+        expected_cursor = cursor + size
+
+        def is_expected_page(response) -> bool:
+            if MATERIAL_LIST_PATH not in response.url or not response.ok:
+                return False
+            try:
+                body = json.loads(response.request.post_data or "{}")
+                return int(body.get("cursor") or 0) == expected_cursor
+            except Exception:
+                return False
+
+        with current_page.expect_response(is_expected_page, timeout=30000) as response_info:
+            current_page.evaluate(
+                """() => {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    for (const element of document.querySelectorAll('*')) {
+                        const style = getComputedStyle(element);
+                        if ((style.overflowY === 'auto' || style.overflowY === 'scroll') &&
+                            element.scrollHeight > element.clientHeight) {
+                            element.scrollTop = element.scrollHeight;
+                        }
+                    }
+                }"""
+            )
+        next_payload = response_info.value.json()
         pages.append(next_payload)
         promotions.extend(next_payload.get("data", {}).get("summary_promotions") or [])
         last_payload = next_payload
+        cursor = expected_cursor
 
-    return promotions[:max(minimum, len(promotions))], pages
+    return promotions[:minimum], pages
 
 
 def visible_control_in_ancestors(label, pattern):
@@ -318,17 +393,17 @@ def reveal_public_business_id(detail_page: Page) -> str | None:
     return None
 
 
-def collect_selection_data() -> dict:
+def collect_selection_data(limit: int | None = None) -> dict:
     with state_lock:
         if page is None or page.is_closed():
             raise RuntimeError("The browser is not open.")
         if "buyin.jinritemai.com" not in page.url:
             raise RuntimeError("The current page is not the official Buyin site.")
         if "/account/login" in page.url:
-            raise RuntimeError("The saved login session has expired. Restart with BUYIN_VISIBLE=1 and scan again.")
+            raise RuntimeError("The saved login session has expired. Click Open login page and scan the QR code.")
         mark_authenticated(page)
 
-        if REQUEST_SPEC_FILE.exists():
+        if USE_DIRECT_MATERIAL and REQUEST_SPEC_FILE.exists():
             try:
                 payload = direct_material_list(page)
             except Exception as exc:
@@ -367,7 +442,8 @@ def collect_selection_data() -> dict:
         data = payload.get("data") if isinstance(payload, dict) else None
         if not isinstance(data, dict):
             raise RuntimeError("material_list response data is empty")
-        target = max(90, int(os.getenv("COLLECT_LIMIT", "90")))
+        target = limit if limit is not None else int(os.getenv("COLLECT_LIMIT", "90"))
+        target = max(1, min(target, 10000))
         promotions, material_pages = collect_material_pages(page, payload, target)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         (DATA_DIR / "material_list_response.json").write_text(
@@ -402,7 +478,10 @@ def collect_selection_data() -> dict:
                 "shop_id": shop_id,
                 "name": nested_value(promotion, ("name", "product_name", "title")),
                 "image_url": image_urls[0] if image_urls else None,
-                "shop_name": shop_info.get("shop_name"),
+                "shop_name": nested_value(shop_info, ("shop_name", "name")),
+                "shop_score": nested_value(
+                    shop_info.get("shop_score_info"), ("score",)
+                ),
                 "month_sale": month_sale,
                 "raw": promotion,
             }
@@ -462,20 +541,22 @@ def collect_selection_data() -> dict:
 
         output = DATA_DIR / "selection_results.json"
         output.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        history = history_store.save_records(results)
         SKIPPED_FILE.write_text(
             json.dumps(skipped_items, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        return {"count": len(results), "skipped": skipped, "file": str(output)}
+        return {
+            "count": len(results),
+            "skipped": skipped,
+            "file": str(output),
+            "collection_id": history["collection_id"],
+            "history_database": str(HISTORY_DATABASE),
+        }
 
 
 def close_browser() -> None:
-    global playwright, context, page
     with state_lock:
-        if context is not None:
-            context.close()
-        if playwright is not None:
-            playwright.stop()
-        playwright = context = page = None
+        _close_browser_context()
 
 
 @app.get("/")
@@ -490,16 +571,24 @@ def results_page():
 
 @app.get("/api/results")
 def results_api():
-    output = DATA_DIR / "selection_results.json"
-    if not output.exists():
-        return jsonify([])
-    return jsonify(json.loads(output.read_text(encoding="utf-8")))
+    return jsonify(history_store.list_records(
+        limit=request.args.get("limit", 100, type=int),
+        offset=request.args.get("offset", 0, type=int),
+        query=request.args.get("q"),
+        collection_id=request.args.get("collection_id"),
+    ))
+
+
+@app.get("/api/history")
+def history_api():
+    collection_id = request.args.get("collection_id")
+    return jsonify({"count": history_store.count(collection_id=collection_id), "database": str(HISTORY_DATABASE)})
 
 
 @app.post("/open-login")
 def open_login():
     try:
-        open_login_page()
+        open_login_page(force_visible=True)
         return jsonify(ok=True)
     except Exception as exc:
         return jsonify(ok=False, error=str(exc)), 500
@@ -517,7 +606,12 @@ def go_selection():
 @app.post("/collect-selection")
 def collect_selection():
     try:
-        result = collect_selection_data()
+        body = request.get_json(silent=True) or {}
+        raw_limit = body.get("limit")
+        limit = int(raw_limit) if raw_limit is not None else None
+        if limit is not None and not 1 <= limit <= 10000:
+            raise ValueError("采集数量必须在 1 到 10000 之间")
+        result = collect_selection_data(limit=limit)
         return jsonify(ok=True, **result)
     except Exception as exc:
         return jsonify(ok=False, error=str(exc)), 500
@@ -529,6 +623,7 @@ def status():
         if page is None or page.is_closed():
             return jsonify(open=False, url=None, title=None)
         try:
+            _switch_to_headless_after_login()
             return jsonify(open=True, url=page.url, title=page.title())
         except Exception as exc:
             return jsonify(open=False, error=str(exc))
