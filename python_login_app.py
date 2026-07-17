@@ -1,5 +1,6 @@
 """Local controller for an authorized Buyin browser session."""
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import json
@@ -7,6 +8,7 @@ import os
 import re
 import secrets
 import time
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from threading import Lock
 
@@ -340,6 +342,11 @@ PAGE = re.sub(
     flags=re.DOTALL,
 )
 PAGE = PAGE.replace(
+    'async function logoutSession(){await action("/logout",{method:"POST"},"退出百应")}',
+    'async function logoutSession(){const result=await action("/logout",{method:"POST"},"退出百应");if(result){setTimeout(()=>window.location.reload(),800)}}',
+    1,
+)
+PAGE = PAGE.replace(
     '</ol><p class="guide-state"',
     '<li><span>4</span><div><strong>切换浏览器模式</strong><p>按需切换爬虫浏览器前台或后台运行。</p></div></li><li><span>5</span><div><strong>退出百应</strong><p>结束本次账号会话并清理登录状态。</p></div></li></ol><p class="guide-state"',
     1,
@@ -368,9 +375,13 @@ PAGE = PAGE.replace(
     1,
 )
 PAGE = PAGE.replace(
+    '.login-qr{width:min(360px,100%);',
+    '.login-qr{image-rendering:pixelated;width:min(360px,100%);',
+    1,
+)
+PAGE = PAGE.replace(
     '</script></body></html>',
     '''
-<script>
 let loginQrTimer=null;
 function stopLoginQr(){
     if(loginQrTimer){clearInterval(loginQrTimer);loginQrTimer=null}
@@ -395,7 +406,6 @@ function startLoginQr(){
     refreshLoginQr();
     loginQrTimer=setInterval(refreshLoginQr,3000);
 }
-</script>
 </script></body></html>''',
     1,
 )
@@ -547,6 +557,14 @@ def first_visible(locator):
         if candidate.is_visible():
             return candidate
     raise RuntimeError("The expected visible control was not found.")
+
+
+def wait_for_visible_control(locator, description: str):
+    try:
+        locator.first.wait_for(state="visible", timeout=DETAIL_PAGE_TIMEOUT_MS)
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(f"未找到{description}，请确认选品页已加载完成后再重试。") from exc
+    return first_visible(locator)
 
 
 def dom_click(locator) -> None:
@@ -736,8 +754,27 @@ def clear_high_sales_filter() -> None:
             print(f"[filter cleanup skipped] {exc}", flush=True)
 
 
-def _reveal_contact_field(detail_page: Page, label_pattern: re.Pattern, contact_type: int) -> str | None:
-    """Click one contact eye and return its value when the endpoint succeeds."""
+def reset_selection_page() -> None:
+    """Reload the selection page so transient filters cannot leak between jobs."""
+    with state_lock:
+        if page is None or page.is_closed():
+            return
+        if not re.search(r"(?:merch-picking|selection)", page.url or ""):
+            return
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=DETAIL_PAGE_TIMEOUT_MS)
+            wait_for_visible_control(
+                page.get_by_text(re.compile(r"\u6708\u9500")),
+                "月销筛选控件",
+            )
+        except Exception as exc:
+            print(f"[selection page reset skipped] {exc}", flush=True)
+
+
+def _reveal_contact_field(
+    detail_page: Page, label_pattern: re.Pattern, contact_type: int
+) -> tuple[str | None, bool]:
+    """Click one contact eye and return its value plus whether it was attempted."""
     candidates = detail_page.get_by_text(label_pattern)
     label_candidates = None
     for index in range(candidates.count()):
@@ -746,7 +783,7 @@ def _reveal_contact_field(detail_page: Page, label_pattern: re.Pattern, contact_
             label_candidates = candidate
             break
     if label_candidates is None:
-        return None
+        return None, False
 
     row = label_candidates.locator("..").first
     containers = (row, row.locator("..").first)
@@ -762,6 +799,7 @@ def _reveal_contact_field(detail_page: Page, label_pattern: re.Pattern, contact_
                 break
         if candidate is None:
             continue
+        clicked = False
         for _ in range(1):
             global last_contact_request_at
             wait_ms = CONTACT_REQUEST_GAP_MS - int((time.monotonic() - last_contact_request_at) * 1000)
@@ -774,9 +812,10 @@ def _reveal_contact_field(detail_page: Page, label_pattern: re.Pattern, contact_
                         and f"contact_type={contact_type}" in response.url
                     ),
                     timeout=CONTACT_RESPONSE_TIMEOUT_MS,
-                ) as response_info:
-                    last_contact_request_at = time.monotonic()
-                    candidate.click(force=True)
+                    ) as response_info:
+                        last_contact_request_at = time.monotonic()
+                        clicked = True
+                        candidate.click(force=True)
                 response = response_info.value
                 try:
                     payload = response.json()
@@ -789,38 +828,51 @@ def _reveal_contact_field(detail_page: Page, label_pattern: re.Pattern, contact_
                 data = payload.get("data") if isinstance(payload, dict) else None
                 contact = data.get("contact") if isinstance(data, dict) else None
                 if contact:
-                    return str(contact)
-                break
+                    return str(contact), True
+                return None, True
             except ContactRateLimitedError:
                 raise
             except Exception:
+                if clicked:
+                    return None, True
                 break
-    return None
+    return None, False
 
 
 def reveal_public_contacts(detail_page: Page) -> dict[str, str | None]:
-    """Read both optional contact fields from the product detail page."""
+    """Read one preferred contact field, trying WeChat before mobile."""
     detail_page.bring_to_front()
     detail_page.wait_for_timeout(DETAIL_SETTLE_MS)
     contact_candidates = detail_page.get_by_text("\u8054\u7cfb\u5546\u5bb6", exact=True)
     if not contact_candidates.count():
         return {"merchant_product_id": None, "mobile": None}
     contact = first_visible(contact_candidates)
+    contact.hover(force=True)
+    detail_page.wait_for_timeout(CONTACT_HOVER_SETTLE_MS)
     hover_target = contact
+    attempted_wechat = False
+    attempted_mobile = False
     for _ in range(2):
-        hover_target.hover(force=True)
-        detail_page.wait_for_timeout(CONTACT_HOVER_SETTLE_MS)
-        values = {
-            "merchant_product_id": _reveal_contact_field(
+        if _ > 0:
+            hover_target = hover_target.locator("..").first
+            hover_target.hover(force=True)
+            detail_page.wait_for_timeout(CONTACT_HOVER_SETTLE_MS)
+        if not attempted_wechat:
+            merchant_product_id, clicked_wechat = _reveal_contact_field(
                 detail_page, re.compile(r"(?:\u5fae\u4fe1\u53f7|merchant_product_id)"), 2
-            ),
-            "mobile": _reveal_contact_field(
+            )
+            attempted_wechat = attempted_wechat or clicked_wechat
+            if merchant_product_id:
+                return {"merchant_product_id": merchant_product_id, "mobile": None}
+        if not attempted_mobile:
+            mobile, clicked_mobile = _reveal_contact_field(
                 detail_page, re.compile(r"(?:\u624b\u673a\u53f7|mobile)"), 1
-            ),
-        }
-        if any(values.values()):
-            return values
-        hover_target = hover_target.locator("..").first
+            )
+            attempted_mobile = attempted_mobile or clicked_mobile
+            if mobile:
+                return {"merchant_product_id": None, "mobile": mobile}
+        if attempted_wechat and attempted_mobile:
+            break
     return {"merchant_product_id": None, "mobile": None}
 
 
@@ -853,10 +905,16 @@ def collect_selection_data(limit: int | None = None) -> dict:
             payload = None
 
         if payload is None:
-            monthly = first_visible(page.get_by_text(re.compile(r"\u6708\u9500")))
+            monthly = wait_for_visible_control(
+                page.get_by_text(re.compile(r"\u6708\u9500")),
+                "月销筛选控件",
+            )
             dom_click(monthly)
             page.wait_for_timeout(500)
-            high_sales = first_visible(page.get_by_text(re.compile(r"(?:\u2265|>=)\s*5000")))
+            high_sales = wait_for_visible_control(
+                page.get_by_text(re.compile(r"(?:\u2265|>=)\s*5000")),
+                "销量大于等于 5000 的筛选项",
+            )
             try:
                 with page.expect_request(
                     lambda request: MATERIAL_LIST_PATH in request.url,
@@ -1406,6 +1464,64 @@ RESULTS_PAGE = RESULTS_PAGE.replace(
     1,
 )
 
+RESULTS_PAGE = RESULTS_PAGE.replace(
+    '<a class="nav-item active" href="/results">鍘嗗彶鏁版嵁</a>',
+    '<a class="nav-item active" href="/results">鍘嗗彶鏁版嵁</a><a class="nav-item" href="/tasks">鎴戠殑浠诲姟</a>',
+    1,
+).replace(
+    '<th>鍒涘缓鏃堕棿</th></tr>',
+    '<th>鍒涘缓鏃堕棿</th><th>认领状态</th></tr>',
+    1,
+).replace(
+    "+esc(item.collected_at||'-').replace('T',' ').slice(0,19)+'</td></tr>",
+    """+esc(item.collected_at||'-').replace('T',' ').slice(0,19)+'</td><td class="claim-cell">'+(item.claim?esc(item.claim.display_name)+'<div class="sub">已认领</div>':'<button class="btn primary claim-btn" onclick="claimProduct('+item.history_id+')">认领</button>')+'</td></tr>""",
+    1,
+).replace(
+    "</style>",
+    ".claim-btn{height:32px;padding:0 12px}.claim-cell{min-width:110px}</style>",
+    1,
+).replace(
+    "function search(){offset=0;load()}",
+    "async function claimProduct(id){const r=await fetch('/api/tasks/'+id+'/claim',{method:'POST'});const d=await r.json();if(!r.ok){alert(d.error||'认领失败');return}location.href='/tasks'}function search(){offset=0;load()}",
+    1,
+)
+
+RESULTS_PAGE = RESULTS_PAGE.replace(
+    "+esc(item.collected_at||'-').replace('T',' ').slice(0,19)+'</span></td></tr>",
+    """+esc(item.collected_at||'-').replace('T',' ').slice(0,19)+'</span></td><td class="claim-cell">'+(item.claim?esc(item.claim.display_name)+'<div class="sub">已认领</div>':(window.currentRole==='admin'?'':'<button class="btn primary claim-btn" onclick="claimProduct('+item.history_id+')">认领</button>'))+'</td></tr>""",
+    1,
+).replace(
+    '<th>閲采集时间</th></tr>',
+    '<th>采集时间</th><th>认领状态</th></tr>',
+    1,
+)
+
+RESULTS_PAGE = RESULTS_PAGE.replace(
+    '<button class="btn primary" id="queryBtn"',
+    '<select class="input" id="contactFilter" aria-label="联系方式筛选"><option value="">联系方式：全部</option><option value="1">联系方式：是</option><option value="0">联系方式：否</option><option value="valid_phone">过滤虚拟号</option></select><button class="btn primary" id="queryBtn"',
+    1,
+).replace(
+    "const saleGt=document.getElementById('monthSaleGt').value.trim();const params=new URLSearchParams({limit:String(size),offset:String(offset),q});",
+    "const saleGt=document.getElementById('monthSaleGt').value.trim();const contact=document.getElementById('contactFilter').value;const params=new URLSearchParams({limit:String(size),offset:String(offset),q});",
+    1,
+).replace(
+    "if(saleGt)params.set('month_sale_gt',saleGt);const items=await fetch('/api/results?'+params).then(r=>r.json());",
+    "if(saleGt)params.set('month_sale_gt',saleGt);if(contact)params.set('has_contact',contact);const items=await fetch('/api/results?'+params).then(r=>r.json());",
+    1,
+).replace(
+    "const saleGt=document.getElementById('monthSaleGt').value.trim();if(query)params.set('q',query);",
+    "const saleGt=document.getElementById('monthSaleGt').value.trim();const contact=document.getElementById('contactFilter').value;if(query)params.set('q',query);",
+    1,
+).replace(
+    "if(saleGt)params.set('month_sale_gt',saleGt);button.disabled=true;",
+    "if(saleGt)params.set('month_sale_gt',saleGt);if(contact)params.set('has_contact',contact);button.disabled=true;",
+    1,
+).replace(
+    "</style>",
+    ".panel-head .toolbar{grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr) minmax(150px,170px) 92px 110px 110px}.panel-head .toolbar #query{grid-column:1}.panel-head .toolbar #shopScoreLt{grid-column:2}.panel-head .toolbar #monthSaleGt{grid-column:3}.panel-head .toolbar #contactFilter{grid-column:4}.panel-head .toolbar #queryBtn{grid-column:5}.panel-head .toolbar #exportBtn{grid-column:6}.panel-head .toolbar #deleteBtn{grid-column:7}@media(max-width:800px){.panel-head .toolbar{grid-template-columns:1fr 1fr}.panel-head .toolbar #query{grid-column:1}.panel-head .toolbar #shopScoreLt{grid-column:2}.panel-head .toolbar #monthSaleGt{grid-column:1}.panel-head .toolbar #contactFilter{grid-column:2}.panel-head .toolbar #queryBtn{grid-column:1}.panel-head .toolbar #exportBtn{grid-column:2}.panel-head .toolbar #deleteBtn{grid-column:1 / -1}}</style>",
+    1,
+)
+
 LOGIN_PAGE = """
 <!doctype html>
 <html lang="zh-CN">
@@ -1444,12 +1560,268 @@ ADMIN_ACCOUNTS_PAGE = ADMIN_ACCOUNTS_PAGE.replace(
     1,
 )
 
+TASKS_PAGE = """
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的任务</title><style>
+:root{--navy:#172235;--blue:#2563eb;--bg:#f3f5f8;--line:#e5e7eb;--text:#1f2937;--muted:#64748b;--red:#b42318}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}.shell{min-height:100vh;display:flex}.side{width:232px;background:var(--navy);color:#dbe5f4;padding:22px 14px;flex:none}.brand{font-size:18px;font-weight:700;color:#fff;padding:0 12px 26px}.brand small{display:block;color:#91a1b8;font-size:11px;font-weight:400;margin-top:4px}.nav-title{padding:12px;font-size:11px;color:#8191a8}.nav-item{display:block;padding:10px 12px;border-radius:5px;color:#c5d2e4;text-decoration:none;margin:3px 0}.nav-item.active,.nav-item:hover{background:#26364e;color:#fff}.main{flex:1;min-width:0}.top{height:64px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 34px}.top h1{margin:0;font-size:18px}.top .user{margin-left:auto;color:var(--muted)}.content{max-width:1200px;margin:0 auto;padding:28px 34px}.panel{background:#fff;border:1px solid var(--line);border-radius:6px;padding:22px}.toolbar{display:flex;gap:10px;margin-bottom:18px}.input,.select{height:38px;border:1px solid #cbd5e1;border-radius:4px;padding:0 10px;font:inherit}.select{min-width:180px}.btn{height:38px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;padding:0 14px;font:inherit;cursor:pointer;text-decoration:none;color:inherit;display:inline-flex;align-items:center;justify-content:center}.btn.primary{background:var(--blue);color:#fff;border-color:var(--blue)}.btn.danger{color:var(--red);border-color:#f0b5b0}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:12px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8fafc;color:#475569}.sub{color:var(--muted);font-size:12px}.empty{padding:36px;text-align:center;color:var(--muted)}@media(max-width:800px){.side{width:70px;padding:18px 8px}.brand{font-size:0}.brand:before{content:"AI";font-size:18px}.brand small,.nav-title{display:none}.nav-item{font-size:0;text-align:center}.nav-item:before{content:"•";font-size:15px}.top{padding:0 18px}.content{padding:20px 16px}.toolbar{flex-wrap:wrap}.input,.select{flex:1;min-width:160px}}
+</style></head><body><div class="shell"><aside class="side"><div class="brand">选品采集<small>Buyin Data Console</small></div><div class="nav-title">工作台</div><a class="nav-item" href="/results">商品列表</a><a class="nav-item active" href="/tasks">我的任务</a>{% if current_user.role == 'admin' %}<a class="nav-item" href="/admin/tasks">全部对接情况</a><a class="nav-item" href="/admin/accounts">账号管理</a>{% endif %}</aside><main class="main"><header class="top"><h1>我的任务</h1><span class="user">{{ current_user.display_name }}（{{ current_user.username }}）　<a href="/auth/logout">退出系统</a></span></header><section class="content"><div class="panel"><div class="toolbar"><select class="select" id="status"><option value="">全部对接情况</option><option>商家拒绝</option><option>商家正在考虑</option><option>商家已下单</option></select><button class="btn primary" onclick="load()">筛选</button></div><div class="table-wrap"><table><thead><tr><th>商品</th><th>商家</th><th>认领人</th><th>认领时间</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table><div class="empty" id="empty" hidden>暂无认领的商品</div></div></div></section></main></div><script>
+const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function load(){const status=encodeURIComponent(document.getElementById('status').value);const items=await fetch('/api/tasks?status='+status).then(r=>r.json());document.getElementById('rows').innerHTML=items.map(i=>'<tr><td>'+esc(i.name||'未命名商品')+'<div class="sub">商品 ID：'+esc(i.product_id||i.commodity_id)+'</div></td><td>'+esc(i.shop_name||'-')+'<div class="sub">店铺 ID：'+esc(i.shop_id||'-')+'</div></td><td>'+esc(i.display_name)+'</td><td>'+esc(i.claimed_at).replace('T',' ').slice(0,19)+'</td><td><a class="btn primary" href="/tasks/'+i.claim_id+'">开始工作</a> <button class="btn danger" onclick="cancelTask('+i.claim_id+')">取消</button></td></tr>').join('');document.getElementById('empty').hidden=items.length>0}async function cancelTask(id){if(!confirm('确定取消认领吗？'))return;const r=await fetch('/api/tasks/'+id,{method:'DELETE'});const d=await r.json();if(!r.ok)alert(d.error||'取消失败');else load()}load();</script></body></html>
+"""
+
+TASK_MODAL_PAGE = """
+<div class="task-modal" id="taskModal" hidden>
+<div class="task-modal-backdrop" data-close-task></div>
+<section class="task-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="taskModalTitle">
+<button class="task-modal-close" id="closeTaskModal" type="button" aria-label="关闭">×</button>
+<h2 id="taskModalTitle">开始工作</h2>
+<p class="task-modal-meta" id="taskModalMeta"></p>
+<div class="task-contact-grid"><div><span>微信号</span><strong id="taskWechat">-</strong></div><div><span>手机号</span><strong id="taskMobile">-</strong></div></div>
+<section class="task-modal-section"><h3>新建对接记录</h3><form id="taskRecordForm"><div class="task-form-grid"><label>商家对接情况<select name="status" required><option>商家拒绝</option><option>商家正在考虑</option><option>商家已下单</option></select></label><label>本次下单单价<input name="unit_price" type="number" min="0" step="0.01" value="0"></label><label>总单数<input name="total_orders" type="number" min="0" step="1" value="0"></label><label>每单下游服务商抽取价<input name="downstream_unit_cost" type="number" min="0" step="0.01" value="0"></label><label>客户实际付款<input name="customer_payment" type="number" step="0.01" value="0.00" readonly></label><label>本次净利润<input name="net_profit" type="number" step="0.01" value="0.00" readonly></label><label class="task-form-wide">下单要求<textarea name="order_requirement"></textarea></label></div><button class="btn primary" type="submit">保存对接记录</button></form></section>
+<section class="task-modal-section"><h3>对接记录</h3><div id="taskRecords"></div></section>
+</section></div>
+<style>
+body.modal-open{overflow:hidden}.task-modal{position:fixed;inset:0;z-index:20}.task-modal[hidden]{display:none}.task-modal-backdrop{position:absolute;inset:0;background:rgba(15,23,42,.52)}.task-modal-dialog{position:relative;width:min(920px,calc(100% - 32px));max-height:calc(100vh - 48px);overflow:auto;margin:24px auto;background:#fff;border-radius:8px;padding:26px;box-shadow:0 24px 70px rgba(15,23,42,.28)}.task-modal-close{position:absolute;right:18px;top:14px;border:0;background:transparent;color:#64748b;font-size:26px;line-height:1;cursor:pointer}.task-modal-dialog h2{margin:0 32px 6px;font-size:20px}.task-modal-meta{margin:0 32px 18px;color:#64748b}.task-contact-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}.task-contact-grid>div{border:1px solid #e5e7eb;border-radius:5px;padding:12px 14px;background:#f8fafc}.task-contact-grid span{display:block;color:#64748b;font-size:12px;margin-bottom:4px}.task-contact-grid strong{font-weight:600;word-break:break-all}.task-modal-section{border-top:1px solid #e5e7eb;padding-top:18px;margin-top:18px}.task-modal-section h3{margin:0 0 14px;font-size:15px}.task-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}.task-form-grid label{display:flex;flex-direction:column;gap:6px;color:#64748b;font-size:13px}.task-form-grid input,.task-form-grid select,.task-form-grid textarea{border:1px solid #cbd5e1;border-radius:4px;padding:9px;font:inherit;color:#1f2937}.task-form-grid textarea{min-height:74px;resize:vertical}.task-form-wide{grid-column:1 / -1}.task-record{border-top:1px solid #e5e7eb;padding:14px 0}.task-record:first-child{border-top:0}.task-record-head{display:flex;justify-content:space-between;gap:12px}.task-record-requirement{white-space:pre-wrap;color:#475569;margin:8px 0}.task-record-amount{width:120px;margin-left:6px}.task-record-empty{color:#64748b}.task-modal .btn{width:auto}@media(max-width:650px){.task-modal-dialog{width:calc(100% - 20px);max-height:calc(100vh - 20px);margin:10px auto;padding:20px}.task-contact-grid,.task-form-grid{grid-template-columns:1fr}.task-form-wide{grid-column:auto}.task-record-head{align-items:flex-start;flex-direction:column}}
+</style>
+<script>
+let activeTaskId=null;const taskModal=document.getElementById('taskModal');const escapeModal=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function taskNumber(value){const parsed=Number(value);return Number.isFinite(parsed)?parsed:0}
+function taskMoney(value){return Math.round((taskNumber(value)+Number.EPSILON)*100)/100}
+function updateTaskFinancialPreview(form){const unitPrice=taskMoney(form.unit_price.value);const totalOrders=Math.max(0,Math.trunc(taskNumber(form.total_orders.value)));const downstreamUnitCost=taskMoney(form.downstream_unit_cost.value);form.customer_payment.value=taskMoney(totalOrders*unitPrice).toFixed(2);form.net_profit.value=taskMoney(totalOrders*unitPrice-totalOrders*downstreamUnitCost).toFixed(2)}
+function taskFinancialPayload(recordId){return {unit_price:document.getElementById('taskUnitPrice-'+recordId).value,total_orders:document.getElementById('taskTotalOrders-'+recordId).value,downstream_unit_cost:document.getElementById('taskDownstreamUnitCost-'+recordId).value}}
+async function loadTaskModalRecords(){const response=await fetch('/api/tasks/'+activeTaskId+'/liaisons');const items=await response.json();if(!response.ok||!Array.isArray(items))throw new Error(items.error||'加载对接记录失败');document.getElementById('taskRecords').innerHTML=items.length?items.map(i=>'<article class="task-record"><div class="task-record-head"><strong>'+escapeModal(i.status)+'</strong><span>'+formatTime(i.created_at)+'　<button class="btn danger" type="button" onclick="deleteTaskRecord('+i.id+')">删除</button></span></div><p class="task-record-requirement">下单要求：'+escapeModal(i.order_requirement||'无下单要求')+'</p><div class="task-record-fields"><label class="task-record-field">本次下单单价<input id="taskUnitPrice-'+i.id+'" type="number" min="0" step="0.01" value="'+taskMoney(i.unit_price).toFixed(2)+'"></label><label class="task-record-field">总单数<input id="taskTotalOrders-'+i.id+'" type="number" min="0" step="1" value="'+Math.max(0,Math.trunc(taskNumber(i.total_orders)))+'"></label><label class="task-record-field">每单下游服务商抽取价<input id="taskDownstreamUnitCost-'+i.id+'" type="number" min="0" step="0.01" value="'+taskMoney(i.downstream_unit_cost).toFixed(2)+'"></label><label class="task-record-field">客户实际付款<input id="taskCustomerPayment-'+i.id+'" type="number" step="0.01" value="'+taskMoney(i.customer_payment).toFixed(2)+'" readonly></label><label class="task-record-field">本次净利润<input id="taskNetProfit-'+i.id+'" type="number" step="0.01" value="'+taskMoney(i.net_profit).toFixed(2)+'" readonly></label></div><div class="task-record-actions"><button class="btn primary" type="button" onclick="updateTaskRecord('+i.id+')">更新金额</button></div></article>').join(''):'<p class="task-record-empty">暂无对接记录</p>';items.forEach(i=>{['taskUnitPrice-','taskTotalOrders-','taskDownstreamUnitCost-'].forEach(prefix=>document.getElementById(prefix+i.id).addEventListener('input',()=>updateTaskRecordPreview(i.id)))})}
+function updateTaskRecordPreview(recordId){const unitPrice=taskMoney(document.getElementById('taskUnitPrice-'+recordId).value);const totalOrders=Math.max(0,Math.trunc(taskNumber(document.getElementById('taskTotalOrders-'+recordId).value)));const downstreamUnitCost=taskMoney(document.getElementById('taskDownstreamUnitCost-'+recordId).value);document.getElementById('taskCustomerPayment-'+recordId).value=taskMoney(totalOrders*unitPrice).toFixed(2);document.getElementById('taskNetProfit-'+recordId).value=taskMoney(totalOrders*unitPrice-totalOrders*downstreamUnitCost).toFixed(2)}
+async function openTaskModal(taskId){const response=await fetch('/api/tasks');const items=await response.json();if(!response.ok||!Array.isArray(items))throw new Error(items.error||'加载任务失败');const task=items.find(item=>Number(item.claim_id)===Number(taskId));if(!task)throw new Error('任务不存在或已取消认领');activeTaskId=taskId;document.getElementById('taskModalTitle').textContent=task.name||'未命名商品';document.getElementById('taskModalMeta').textContent='商家：'+(task.shop_name||'-')+'　商品 ID：'+(task.product_id||task.commodity_id||'-');document.getElementById('taskWechat').textContent=task.wechat||task.merchant_product_id||'-';document.getElementById('taskMobile').textContent=task.mobile||'-';taskModal.hidden=false;document.body.classList.add('modal-open');await loadTaskModalRecords()}
+function closeTaskModal(){taskModal.hidden=true;document.body.classList.remove('modal-open');activeTaskId=null}
+document.getElementById('closeTaskModal').addEventListener('click',closeTaskModal);document.querySelector('[data-close-task]').addEventListener('click',closeTaskModal);document.addEventListener('keydown',event=>{if(event.key==='Escape'&&!taskModal.hidden)closeTaskModal()});document.addEventListener('click',event=>{const link=event.target.closest('a[href^="/tasks/"]');if(!link)return;event.preventDefault();openTaskModal(link.getAttribute('href').split('/').pop()).catch(error=>alert(error.message))});
+const taskRecordForm=document.getElementById('taskRecordForm');['unit_price','total_orders','downstream_unit_cost'].forEach(name=>taskRecordForm[name].addEventListener('input',()=>updateTaskFinancialPreview(taskRecordForm)));updateTaskFinancialPreview(taskRecordForm);
+taskRecordForm.addEventListener('submit',async event=>{event.preventDefault();try{const response=await fetch('/api/tasks/'+activeTaskId+'/liaisons',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(event.target)))});const data=await response.json();if(!response.ok)throw new Error(data.error||'保存对接记录失败');event.target.reset();updateTaskFinancialPreview(event.target);await loadTaskModalRecords()}catch(error){alert(error.message)}})
+async function updateTaskRecord(recordId){try{const response=await fetch('/api/liaisons/'+recordId,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(taskFinancialPayload(recordId))});const data=await response.json();if(!response.ok)throw new Error(data.error||'更新金额失败');await loadTaskModalRecords()}catch(error){alert(error.message)}}
+async function deleteTaskRecord(recordId){if(!confirm('确定删除这条对接记录吗？'))return;try{const response=await fetch('/api/liaisons/'+recordId,{method:'DELETE'});const data=await response.json();if(!response.ok)throw new Error(data.error||'删除对接记录失败');await loadTaskModalRecords()}catch(error){alert(error.message)}}
+</script>
+<style>.task-record-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.task-record-field{display:flex;flex-direction:column;gap:5px;color:#64748b;font-size:13px}.task-record-field input{border:1px solid #cbd5e1;border-radius:4px;padding:8px;font:inherit;color:#1f2937;min-width:0}.task-record-field input[readonly]{background:#f8fafc}.task-record-actions{display:flex;gap:8px;margin-top:10px}@media(max-width:650px){.task-record-fields{grid-template-columns:1fr}}</style>
+"""
+
+TASKS_PAGE = TASKS_PAGE.replace("</body></html>", TASK_MODAL_PAGE + "</body></html>", 1)
+
+TASK_DETAIL_PAGE = """
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>商品对接详情</title><style>
+body{margin:0;background:#f3f5f8;color:#1f2937;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}.wrap{max-width:1100px;margin:0 auto;padding:28px 20px}.panel{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:22px;margin-bottom:18px}h1,h2{margin:0 0 16px}h1{font-size:22px}.meta{color:#64748b}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.field{display:flex;flex-direction:column;gap:6px}.field label{color:#64748b;font-size:13px}.field input,.field select,.field textarea{border:1px solid #cbd5e1;border-radius:4px;padding:9px;font:inherit}.field textarea{min-height:90px;resize:vertical}.btn{height:38px;border:1px solid #cbd5e1;background:#fff;border-radius:4px;padding:0 14px;font:inherit;cursor:pointer}.primary{background:#2563eb;color:#fff;border-color:#2563eb}.danger{color:#b42318;border-color:#f0b5b0}.actions{margin-top:16px}.record{border-top:1px solid #e5e7eb;padding:16px 0}.record:first-child{border-top:0}.record-head{display:flex;justify-content:space-between;gap:12px}.amount{width:130px}.requirement{white-space:pre-wrap;margin:8px 0;color:#475569}@media(max-width:700px){.grid{grid-template-columns:1fr}.record-head{align-items:flex-start;flex-direction:column}}
+ .record-financials{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin-top:10px}.record-financials .field{min-width:0}.record-financials input[readonly]{background:#f8fafc}@media(max-width:700px){.record-financials{grid-template-columns:1fr}}
+</style></head><body><main class="wrap"><p><a href="/tasks">返回我的任务</a></p><section class="panel"><h1>{{ task.name or '未命名商品' }}</h1><p class="meta">商家：{{ task.shop_name or '-' }}　商品 ID：{{ task.product_id or task.commodity_id or '-' }}　认领人：{{ task.display_name }}</p></section><section class="panel"><h2>新建对接记录</h2><form id="recordForm"><div class="grid"><div class="field"><label>商家对接情况</label><select name="status" required><option>商家拒绝</option><option>商家正在考虑</option><option>商家已下单</option></select></div><div class="field"><label>本次下单单价</label><input name="unit_price" type="number" min="0" step="0.01" value="0"></div><div class="field"><label>总单数</label><input name="total_orders" type="number" min="0" step="1" value="0"></div><div class="field"><label>每单下游服务商抽取价</label><input name="downstream_unit_cost" type="number" min="0" step="0.01" value="0"></div><div class="field"><label>客户实际付款</label><input name="customer_payment" type="number" step="0.01" value="0.00" readonly></div><div class="field"><label>本次净利润</label><input name="net_profit" type="number" step="0.01" value="0.00" readonly></div><div class="field" style="grid-column:1/-1"><label>下单要求</label><textarea name="order_requirement"></textarea></div></div><div class="actions"><button class="btn primary">保存对接记录</button></div></form></section><section class="panel"><h2>对接记录</h2><div id="records"></div></section></main><script>
+const claimId={{ task.claim_id }};const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const detailNumber=v=>{const n=Number(v);return Number.isFinite(n)?n:0};const detailMoney=v=>Math.round((detailNumber(v)+Number.EPSILON)*100)/100;function updateDetailPreview(form){const price=detailMoney(form.unit_price.value);const orders=Math.max(0,Math.trunc(detailNumber(form.total_orders.value)));const cost=detailMoney(form.downstream_unit_cost.value);form.customer_payment.value=detailMoney(price*orders).toFixed(2);form.net_profit.value=detailMoney(price*orders-cost*orders).toFixed(2)}async function load(){const response=await fetch('/api/tasks/'+claimId+'/liaisons');const items=await response.json();if(!response.ok||!Array.isArray(items))throw new Error(items.error||'加载对接记录失败');document.getElementById('records').innerHTML=items.length?items.map(i=>'<article class="record"><div class="record-head"><strong>'+esc(i.status)+'</strong><span>'+esc(i.created_at).replace('T',' ').slice(0,19)+'　<button class="btn danger" onclick="removeRecord('+i.id+')">删除</button></span></div><p class="requirement">下单要求：'+esc(i.order_requirement||'无下单要求')+'</p><div class="record-financials"><label class="field"><span>本次下单单价</span><input id="unitPrice-'+i.id+'" type="number" min="0" step="0.01" value="'+detailMoney(i.unit_price).toFixed(2)+'"></label><label class="field"><span>总单数</span><input id="totalOrders-'+i.id+'" type="number" min="0" step="1" value="'+Math.max(0,Math.trunc(detailNumber(i.total_orders)))+'"></label><label class="field"><span>每单下游服务商抽取价</span><input id="downstreamUnitCost-'+i.id+'" type="number" min="0" step="0.01" value="'+detailMoney(i.downstream_unit_cost).toFixed(2)+'"></label><label class="field"><span>客户实际付款</span><input id="customerPayment-'+i.id+'" type="number" step="0.01" value="'+detailMoney(i.customer_payment).toFixed(2)+'" readonly></label><label class="field"><span>本次净利润</span><input id="netProfit-'+i.id+'" type="number" step="0.01" value="'+detailMoney(i.net_profit).toFixed(2)+'" readonly></label></div><div class="actions"><button class="btn primary" onclick="saveFinancials('+i.id+')">更新金额</button></div></article>').join(''):'<p class="meta">暂无对接记录</p>';items.forEach(i=>['unitPrice-','totalOrders-','downstreamUnitCost-'].forEach(prefix=>document.getElementById(prefix+i.id).addEventListener('input',()=>updateDetailRecordPreview(i.id))));}function updateDetailRecordPreview(id){const price=detailMoney(document.getElementById('unitPrice-'+id).value);const orders=Math.max(0,Math.trunc(detailNumber(document.getElementById('totalOrders-'+id).value)));const cost=detailMoney(document.getElementById('downstreamUnitCost-'+id).value);document.getElementById('customerPayment-'+id).value=detailMoney(price*orders).toFixed(2);document.getElementById('netProfit-'+id).value=detailMoney(price*orders-cost*orders).toFixed(2)}const recordForm=document.getElementById('recordForm');['unit_price','total_orders','downstream_unit_cost'].forEach(name=>recordForm[name].addEventListener('input',()=>updateDetailPreview(recordForm)));updateDetailPreview(recordForm);recordForm.onsubmit=async e=>{e.preventDefault();const response=await fetch('/api/tasks/'+claimId+'/liaisons',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.fromEntries(new FormData(e.target)))});const data=await response.json();if(!response.ok){alert(data.error||'保存失败');return}e.target.reset();updateDetailPreview(e.target);await load()};async function saveFinancials(id){const response=await fetch('/api/liaisons/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({unit_price:document.getElementById('unitPrice-'+id).value,total_orders:document.getElementById('totalOrders-'+id).value,downstream_unit_cost:document.getElementById('downstreamUnitCost-'+id).value})});const data=await response.json();if(!response.ok){alert(data.error||'更新失败');return}await load()}async function removeRecord(id){if(!confirm('确定删除这条对接记录吗？'))return;const response=await fetch('/api/liaisons/'+id,{method:'DELETE'});const data=await response.json();if(!response.ok){alert(data.error||'删除失败');return}await load()}load().catch(error=>alert(error.message));</script></body></html>
+"""
+TASK_DETAIL_PAGE = TASK_DETAIL_PAGE.replace(
+    "</p></section><section class=\"panel\"><h2>",
+    "</p><p class=\"meta\">微信号：{{ task.wechat or task.merchant_product_id or '-' }}　手机号：{{ task.mobile or '-' }}</p></section><section class=\"panel\"><h2>",
+    1,
+)
+
+LOCAL_TIME_JS = (
+    "<script>function formatTime(value){const date=new Date(value);if(Number.isNaN(date.getTime()))return String(value??'-');"
+    "return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',"
+    "hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(date)}</script>"
+)
+
+
+def _local_time_page(page: str) -> str:
+    replacements = {
+        "esc(item.collected_at||'-').replace('T',' ').slice(0,19)": "formatTime(item.collected_at)",
+        "esc(i.claimed_at).replace('T',' ').slice(0,19)": "formatTime(i.claimed_at)",
+        "esc(i.created_at).replace('T',' ').slice(0,19)": "formatTime(i.created_at)",
+    }
+    for old, new in replacements.items():
+        page = page.replace(old, new)
+    return page.replace("<script>", LOCAL_TIME_JS + "<script>", 1)
+
+
+def _format_local_time(value: object) -> object:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return value
+
+
+def _apply_fixed_navigation(page: str, active: str) -> str:
+    role = g.current_user["role"]
+    items = [
+        ("workbench", "/", "工作台"),
+        ("results", "/results", "历史数据"),
+        ("tasks", "/tasks", "我的任务"),
+    ]
+    if role == "admin":
+        items = [
+            ("workbench", "/", "工作台"),
+            ("console", "/console", "采集控制台"),
+            ("results", "/results", "历史数据"),
+            ("tasks", "/tasks", "我的任务"),
+            ("admin_tasks", "/admin/tasks", "全部对接情况"),
+            ("accounts", "/admin/accounts", "账号管理"),
+        ]
+    links = "".join(
+        f'<a class="nav-item{" active" if key == active else ""}" href="{href}">{label}</a>'
+        for key, href, label in items
+    )
+    navigation = (
+        '<aside class="side"><div class="brand">选品采集<small>Buyin Data Console</small></div>'
+        '<div class="nav-title">工作台</div>' + links + "</aside>"
+    )
+    return re.sub(r'<aside class="side">.*?</aside>', navigation, page, count=1, flags=re.DOTALL)
+
+
+def _apply_current_user_header(page: str) -> str:
+    user = g.current_user
+    label = "管理员" if user["role"] == "admin" else "当前账号"
+    header = f'<span class="user">{label}：{user["display_name"]}（{user["username"]}）　<a href="/auth/logout">退出系统</a></span>'
+    return re.sub(r'<span class="user">.*?</span>', header, page, count=1)
+
+
+ADMIN_DASHBOARD_STYLE = """
+.dashboard{margin:0 0 26px}.dashboard-head{display:flex;justify-content:space-between;align-items:flex-end;gap:20px;margin-bottom:18px}.dashboard-head h2{margin:0;font-size:24px}.dashboard-head p{margin:5px 0 0;color:var(--muted)}.dashboard-range{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}.dashboard-range label{display:flex;flex-direction:column;gap:5px;color:var(--muted);font-size:12px}.dashboard-range input{height:36px;border:1px solid #cfd5df;border-radius:4px;padding:0 9px;font:inherit;color:var(--text)}.dashboard-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-bottom:16px}.dashboard-panel{background:#fff;border:1px solid var(--line);border-radius:6px;min-width:0}.dashboard-panel-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}.dashboard-panel-head h3{margin:0;font-size:15px}.dashboard-panel-head span{font-size:12px;color:var(--muted)}.dashboard-panel-body{padding:16px 18px}.dashboard-pie-layout{display:grid;grid-template-columns:minmax(210px,1fr) minmax(160px,220px);gap:10px;align-items:center;min-height:270px}.dashboard-chart{width:100%;height:auto;display:block}.dashboard-legend{display:flex;flex-direction:column;gap:7px}.dashboard-legend button{display:grid;grid-template-columns:10px minmax(0,1fr) auto;align-items:center;gap:7px;border:0;background:transparent;text-align:left;padding:4px 0;color:var(--text);font:inherit;cursor:pointer}.dashboard-legend button:hover{color:var(--blue)}.dashboard-legend i{width:9px;height:9px;border-radius:2px}.dashboard-legend .legend-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dashboard-legend .legend-value{color:var(--muted);font-size:12px}.dashboard-line{grid-column:1 / -1}.dashboard-line .dashboard-panel-body{overflow:auto}.dashboard-line svg{min-width:680px}.dashboard-empty{fill:var(--muted);font-size:13px}.dashboard-axis{stroke:#cbd5e1;stroke-width:1}.dashboard-gridline{stroke:#e5e7eb;stroke-width:1}.dashboard-axis-label{fill:#64748b;font-size:11px}.dashboard-line-point{stroke:#fff;stroke-width:2}.dashboard-modal{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:rgba(15,23,42,.48)}.dashboard-modal[hidden]{display:none}.dashboard-modal-dialog{width:min(680px,100%);max-height:min(680px,calc(100vh - 40px));overflow:auto;background:#fff;border-radius:7px;padding:24px;box-shadow:0 20px 60px rgba(15,23,42,.25)}.dashboard-modal-head{display:flex;justify-content:space-between;align-items:center;gap:12px}.dashboard-modal-head h3{margin:0;font-size:18px}.dashboard-close{border:0;background:transparent;color:#64748b;font-size:24px;cursor:pointer}.dashboard-summary{margin:14px 0;padding:12px;background:#f8fafc;border:1px solid var(--line);color:#475569}.dashboard-detail-table{width:100%;border-collapse:collapse}.dashboard-detail-table th,.dashboard-detail-table td{padding:10px;border-bottom:1px solid var(--line);text-align:left}.dashboard-detail-table th{background:#f8fafc;color:#475569;font-size:12px}.dashboard-detail-table td:last-child{text-align:right}.dashboard-updated{font-size:12px;color:var(--muted)}@media(max-width:900px){.dashboard-head{align-items:flex-start;flex-direction:column}.dashboard-grid{grid-template-columns:1fr}.dashboard-line{grid-column:auto}}@media(max-width:620px){.dashboard-pie-layout{grid-template-columns:1fr}.dashboard-pie-layout .dashboard-chart{max-height:230px}.dashboard-range{width:100%}.dashboard-range label{flex:1;min-width:130px}.dashboard-range .btn{width:100%}}
+"""
+
+ADMIN_DASHBOARD_CONTENT = """
+<section class="dashboard" aria-label="管理员数据工作台">
+<div class="dashboard-head"><div><h2>对接运营工作台</h2><p>按用户、商家和日期查看对接进展与任务额。</p><span class="dashboard-updated" id="dashboardUpdated">正在加载统计...</span></div><div class="dashboard-range"><label>开始日期<input id="dashboardStart" type="date"></label><label>结束日期<input id="dashboardEnd" type="date"></label><button class="btn primary" id="dashboardLoad" type="button">查询</button></div></div>
+<div class="dashboard-grid"><section class="dashboard-panel"><div class="dashboard-panel-head"><h3>用户对接商家数量</h3><span>全量数据，点击用户查看明细</span></div><div class="dashboard-panel-body dashboard-pie-layout"><svg class="dashboard-chart" id="merchantPie" viewBox="0 0 320 250" role="img" aria-label="用户对接商家数量饼图"></svg><div class="dashboard-legend" id="merchantPieLegend"></div></div></section><section class="dashboard-panel"><div class="dashboard-panel-head"><h3>用户累计任务额</h3><span>全量数据汇总</span></div><div class="dashboard-panel-body dashboard-pie-layout"><svg class="dashboard-chart" id="amountPie" viewBox="0 0 320 250" role="img" aria-label="用户累计任务额饼图"></svg><div class="dashboard-legend" id="amountPieLegend"></div></div></section></div>
+<div class="dashboard-grid"><section class="dashboard-panel dashboard-line"><div class="dashboard-panel-head"><h3>每日商家对接对比</h3><span>沟通、同意、拒绝</span></div><div class="dashboard-panel-body"><svg class="dashboard-chart" id="contactLine" viewBox="0 0 900 300" role="img" aria-label="每日商家对接对比折线图"></svg><div class="dashboard-legend" id="contactLineLegend"></div></div></section><section class="dashboard-panel dashboard-line"><div class="dashboard-panel-head"><h3>每日用户任务额</h3><span>按用户逐日汇总</span></div><div class="dashboard-panel-body"><svg class="dashboard-chart" id="dailyAmountLine" viewBox="0 0 900 300" role="img" aria-label="每日用户任务额折线图"></svg><div class="dashboard-legend" id="dailyAmountLineLegend"></div></div></section></div>
+</section>
+<div class="dashboard-modal" id="merchantDetailModal" hidden><section class="dashboard-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="merchantDetailTitle"><div class="dashboard-modal-head"><h3 id="merchantDetailTitle">用户商家明细</h3><button class="dashboard-close" id="merchantDetailClose" type="button" aria-label="关闭">×</button></div><div class="dashboard-summary" id="merchantDetailSummary"></div><div id="merchantDetailBody"></div></section></div>
+"""
+ADMIN_DASHBOARD_CONTENT = ADMIN_DASHBOARD_CONTENT.replace("管理员数据工作台", "对接运营工作台")
+ADMIN_DASHBOARD_CONTENT = (
+    ADMIN_DASHBOARD_CONTENT
+    .replace("用户累计任务额", "用户累计净利润")
+    .replace("每日用户任务额", "每日用户净利润")
+    .replace("按用户逐日汇总", "按用户逐日汇总净利润")
+    .replace("按用户、商家和日期查看对接进展与任务额。", "按用户、商家和日期查看对接进展与净利润。")
+)
+
+ADMIN_DASHBOARD_SCRIPT = """
+<script>
+const dashboardColors=['#2563eb','#16805c','#d97706','#b42318','#7c3aed','#0891b2','#db2777','#4b5563'];let dashboardData=null;
+const dashboardEsc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function dashboardDate(value){return new Intl.DateTimeFormat('sv-SE',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(value)}
+function setDashboardDates(){const end=dashboardDate(new Date());const startDate=new Date(end+'T00:00:00+08:00');startDate.setDate(startDate.getDate()-6);document.getElementById('dashboardEnd').value=end;document.getElementById('dashboardStart').value=dashboardDate(startDate)}
+function dashboardNumber(value){return Number(value||0).toLocaleString('zh-CN',{maximumFractionDigits:2})}
+function polarPoint(cx,cy,r,angle){return [cx+r*Math.cos(angle),cy+r*Math.sin(angle)]}
+function piePath(cx,cy,r,start,end){const [x1,y1]=polarPoint(cx,cy,r,start);const [x2,y2]=polarPoint(cx,cy,r,end);return 'M '+cx+' '+cy+' L '+x1+' '+y1+' A '+r+' '+r+' 0 '+(end-start>Math.PI?1:0)+' 1 '+x2+' '+y2+' Z'}
+function renderPie(svgId,legendId,items,valueKey,onClick){const svg=document.getElementById(svgId),legend=document.getElementById(legendId);svg.innerHTML='';legend.innerHTML='';const values=items.map(item=>Number(item[valueKey]||0)),total=values.reduce((sum,value)=>sum+value,0);if(!total){svg.innerHTML='<text class="dashboard-empty" x="160" y="128" text-anchor="middle">暂无数据</text>';return}let angle=-Math.PI/2;items.forEach((item,index)=>{const value=values[index];if(!value)return;const next=angle+value/total*Math.PI*2;const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('d',value===total?'M160 128 m-88 0 a88 88 0 1 0 176 0 a88 88 0 1 0 -176 0':piePath(160,128,88,angle,next));path.setAttribute('fill',dashboardColors[index%dashboardColors.length]);path.setAttribute('stroke','#fff');path.setAttribute('stroke-width','2');path.setAttribute('tabindex','0');path.setAttribute('role','button');path.setAttribute('aria-label',(item.display_name||item.username)+' '+dashboardNumber(value));if(onClick)path.addEventListener('click',()=>onClick(item));svg.appendChild(path);angle=next});legend.innerHTML=items.map((item,index)=>'<button type="button" data-index="'+index+'"><i style="background:'+dashboardColors[index%dashboardColors.length]+'"></i><span class="legend-name">'+dashboardEsc(item.display_name||item.username)+'</span><span class="legend-value">'+dashboardNumber(item[valueKey])+'</span></button>').join('');legend.querySelectorAll('button').forEach(button=>{if(onClick)button.addEventListener('click',()=>onClick(items[Number(button.dataset.index)]))})}
+function renderLine(svgId,legendId,dates,series,valuePrefix){const svg=document.getElementById(svgId),legend=document.getElementById(legendId);svg.innerHTML='';legend.innerHTML='';const width=900,height=300,left=52,right=20,top=18,bottom=42,plotWidth=width-left-right,plotHeight=height-top-bottom,max=Math.max(1,...series.flatMap(item=>item.values.map(Number)));if(!dates.length||!series.length){svg.innerHTML='<text class="dashboard-empty" x="450" y="145" text-anchor="middle">暂无数据</text>';return}for(let tick=0;tick<=4;tick++){const y=top+plotHeight-tick/4*plotHeight;const line=document.createElementNS('http://www.w3.org/2000/svg','line');line.setAttribute('x1',left);line.setAttribute('x2',width-right);line.setAttribute('y1',y);line.setAttribute('y2',y);line.setAttribute('class','dashboard-gridline');svg.appendChild(line);const label=document.createElementNS('http://www.w3.org/2000/svg','text');label.setAttribute('x',left-8);label.setAttribute('y',y+4);label.setAttribute('text-anchor','end');label.setAttribute('class','dashboard-axis-label');label.textContent=dashboardNumber(max*tick/4);svg.appendChild(label)}const axis=document.createElementNS('http://www.w3.org/2000/svg','line');axis.setAttribute('x1',left);axis.setAttribute('x2',width-right);axis.setAttribute('y1',top+plotHeight);axis.setAttribute('y2',top+plotHeight);axis.setAttribute('class','dashboard-axis');svg.appendChild(axis);dates.forEach((date,index)=>{const x=left+(dates.length===1?plotWidth/2:index/(dates.length-1)*plotWidth);const label=document.createElementNS('http://www.w3.org/2000/svg','text');label.setAttribute('x',x);label.setAttribute('y',height-14);label.setAttribute('text-anchor','middle');label.setAttribute('class','dashboard-axis-label');label.textContent=date.slice(5);svg.appendChild(label)});series.forEach((item,index)=>{const points=item.values.map((value,pointIndex)=>{const x=left+(dates.length===1?plotWidth/2:pointIndex/(dates.length-1)*plotWidth);const y=top+plotHeight-(Number(value)||0)/max*plotHeight;return [x,y]});const line=document.createElementNS('http://www.w3.org/2000/svg','polyline');line.setAttribute('points',points.map(point=>point.join(',')).join(' '));line.setAttribute('fill','none');line.setAttribute('stroke',dashboardColors[index%dashboardColors.length]);line.setAttribute('stroke-width','2.5');svg.appendChild(line);points.forEach(point=>{const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');circle.setAttribute('cx',point[0]);circle.setAttribute('cy',point[1]);circle.setAttribute('r','4');circle.setAttribute('fill',dashboardColors[index%dashboardColors.length]);circle.setAttribute('class','dashboard-line-point');svg.appendChild(circle)})});legend.innerHTML=series.map((item,index)=>'<button type="button"><i style="background:'+dashboardColors[index%dashboardColors.length]+'"></i><span class="legend-name">'+dashboardEsc(item.name)+'</span></button>').join('')}
+function openMerchantDetails(item){const rows=(dashboardData.merchant_details||{})[item.username]||[];const total=rows.reduce((sum,row)=>sum+Number(row.task_amount||0),0);document.getElementById('merchantDetailTitle').textContent=(item.display_name||item.username)+'的商家明细';document.getElementById('merchantDetailSummary').textContent='商家数量：'+rows.length+'　对接金额汇总：'+dashboardNumber(total);document.getElementById('merchantDetailBody').innerHTML=rows.length?'<table class="dashboard-detail-table"><thead><tr><th>商家</th><th>商品数</th><th>对接金额</th></tr></thead><tbody>'+rows.map(row=>'<tr><td>'+dashboardEsc(row.shop_name)+'<div class="sub">'+dashboardEsc(row.shop_id)+'</div></td><td>'+row.product_count+'</td><td>'+dashboardNumber(row.task_amount)+'</td></tr>').join('')+'</tbody></table>':'<p class="muted">暂无商家明细</p>';document.getElementById('merchantDetailModal').hidden=false}
+function closeMerchantDetails(){document.getElementById('merchantDetailModal').hidden=true}
+function renderDashboard(data){dashboardData=data;renderPie('merchantPie','merchantPieLegend',data.user_merchants,'merchant_count',openMerchantDetails);renderPie('amountPie','amountPieLegend',data.user_amounts,'task_amount');const contactSeries=[{name:'沟通商家',values:data.daily_contacts.map(item=>item.contacted)},{name:'商家同意',values:data.daily_contacts.map(item=>item.agreed)},{name:'商家拒绝',values:data.daily_contacts.map(item=>item.refused)}];renderLine('contactLine','contactLineLegend',data.dates,contactSeries);renderLine('dailyAmountLine','dailyAmountLineLegend',data.dates,data.daily_amounts.map(item=>({name:item.display_name,values:item.values})),'¥');document.getElementById('dashboardUpdated').textContent='统计范围：'+data.start_date+' 至 '+data.end_date}
+async function loadDashboard(){const start=document.getElementById('dashboardStart').value,end=document.getElementById('dashboardEnd').value;if(!start||!end)return;const button=document.getElementById('dashboardLoad');button.disabled=true;try{const response=await fetch('/api/dashboard?start='+encodeURIComponent(start)+'&end='+encodeURIComponent(end));const data=await response.json();if(!response.ok)throw new Error(data.error||'加载统计失败');renderDashboard(data)}catch(error){document.getElementById('dashboardUpdated').textContent=error.message;alert(error.message)}finally{button.disabled=false}}
+document.getElementById('dashboardLoad').addEventListener('click',loadDashboard);document.getElementById('merchantDetailClose').addEventListener('click',closeMerchantDetails);document.getElementById('merchantDetailModal').addEventListener('click',event=>{if(event.target.id==='merchantDetailModal')closeMerchantDetails()});document.addEventListener('keydown',event=>{if(event.key==='Escape')closeMerchantDetails()});setDashboardDates();loadDashboard();
+</script>
+"""
+ADMIN_DASHBOARD_SCRIPT = (
+    ADMIN_DASHBOARD_SCRIPT
+    .replace("row.task_amount", "row.net_profit")
+    .replace("data.user_amounts,'task_amount'", "data.user_amounts,'net_profit'")
+    .replace("对接金额汇总", "净利润汇总")
+    .replace("<th>对接金额</th>", "<th>净利润</th>")
+)
+
+
+def _build_workbench_page() -> str:
+    page = PAGE.replace("</style>", ADMIN_DASHBOARD_STYLE + "</style>", 1)
+    dashboard_content = ADMIN_DASHBOARD_CONTENT
+    if g.current_user["role"] != "admin":
+        dashboard_content = dashboard_content.replace("全量数据，点击用户查看明细", "当前账号数据")
+        dashboard_content = dashboard_content.replace("全量数据汇总", "当前账号数据汇总")
+    content_start = page.find('<section class="content">')
+    if content_start < 0:
+        raise RuntimeError("工作台页面模板缺少内容容器")
+    page = (
+        page[:content_start]
+        + '<section class="content">'
+        + dashboard_content
+        + "</section></main></div>"
+        + ADMIN_DASHBOARD_SCRIPT
+        + "</body></html>"
+    )
+    page = page.replace(
+        '<a class="nav-item active" href="/">',
+        '<a class="nav-item active" href="/">工作台</a><a class="nav-item" href="/console">',
+        1,
+    )
+    page = page.replace(
+        "</aside>",
+        '<a class="nav-item" href="/tasks">我的任务</a><a class="nav-item" href="/admin/tasks">全部对接情况</a><a class="nav-item" href="/admin/accounts">账号管理</a></aside>',
+        1,
+    )
+    page = re.sub(
+        r'<header class="top"><h1>.*?</h1>',
+        '<header class="top"><h1>对接运营工作台</h1>',
+        page,
+        count=1,
+    )
+    return _apply_current_user_header(_apply_fixed_navigation(page, "workbench"))
+
+
+def _build_admin_tasks_page() -> str:
+    page = ADMIN_TASKS_PAGE.replace(
+        "</style>",
+        ".shell{min-height:100vh;display:flex}.side{width:232px;background:#172235;color:#dbe5f4;padding:22px 14px;flex:none}.brand{font-size:18px;font-weight:700;color:#fff;padding:0 12px 26px}.brand small{display:block;color:#91a1b8;font-size:11px;font-weight:400;margin-top:4px}.nav-title{padding:12px;font-size:11px;color:#8191a8}.nav-item{display:block;padding:10px 12px;border-radius:5px;color:#c5d2e4;text-decoration:none;margin:3px 0}.nav-item.active,.nav-item:hover{background:#26364e;color:#fff}.main{flex:1;min-width:0}.top{height:64px;background:#fff;border-bottom:1px solid #e5e7eb;display:flex;align-items:center;padding:0 34px}.top h1{margin:0;font-size:18px}.top .user{margin-left:auto;color:#64748b}.content{max-width:1250px;margin:0 auto;padding:28px 34px}.wrap{max-width:none;margin:0;padding:0}@media(max-width:800px){.side{width:70px;padding:18px 8px}.brand{font-size:0}.brand:before{content:'AI';font-size:18px}.brand small,.nav-title{display:none}.nav-item{font-size:0;text-align:center}.nav-item:before{content:'•';font-size:15px}.top{padding:0 18px}.content{padding:20px 16px}}</style>",
+        1,
+    )
+    page = page.replace(
+        '<body><main class="wrap">',
+        '<body><div class="shell"><aside class="side"></aside><main class="main"><header class="top"><h1>全部对接情况</h1><span class="user"></span></header><section class="content"><div class="wrap">',
+        1,
+    )
+    page = page.replace("</main></body></html>", "</div></section></main></div></body></html>", 1)
+    return _apply_current_user_header(_apply_fixed_navigation(page, "admin_tasks"))
+
+
+ADMIN_ACCOUNTS_PAGE = ADMIN_ACCOUNTS_PAGE.replace(
+    'grid-template-columns:repeat(2,minmax(0,1fr))',
+    'grid-template-columns:repeat(3,minmax(0,1fr))',
+    1,
+).replace(
+    '<div class="field"><label for="new_password">初始密码</label>',
+    '<div class="field"><label for="display_name">中文名</label><input id="display_name" name="display_name" maxlength="32" required></div><div class="field"><label for="new_password">初始密码</label>',
+    1,
+).replace(
+    '{{ user.username }}{% if user.role == \'admin\' %}（管理员）{% endif %}',
+    '{{ user.username }}{% if user.display_name %}（{{ user.display_name }}）{% endif %}{% if user.role == \'admin\' %}（管理员）{% endif %}',
+    1,
+).replace(
+    '<th>账号</th><th>权限</th>',
+    '<th>账号</th><th>中文名</th><th>权限</th>',
+    1,
+).replace(
+    '<td>{{ user.username }}</td><td>{{ \'管理员\' if user.role == \'admin\' else \'普通用户\' }}</td>',
+    '<td>{{ user.username }}</td><td>{{ user.display_name }}</td><td>{{ \'管理员\' if user.role == \'admin\' else \'普通用户\' }}</td>',
+    1,
+).replace(
+    '管理员：{{ current_user.username }}',
+    '管理员：{{ current_user.display_name }}（{{ current_user.username }}）',
+    1,
+)
+ADMIN_ACCOUNTS_PAGE = ADMIN_ACCOUNTS_PAGE.replace(
+    "</style>",
+    ".btn.danger{color:#b42318;border-color:#f0b5b0}</style>",
+    1,
+).replace(
+    '<th>账号</th><th>中文名</th><th>权限</th>',
+    '<th>账号</th><th>中文名</th><th>权限</th><th>操作</th>',
+    1,
+).replace(
+    '<td>{{ user.username }}</td><td>{{ user.display_name }}</td><td>{{ \'管理员\' if user.role == \'admin\' else \'普通用户\' }}</td>',
+    "<td>{{ user.username }}</td><td>{{ user.display_name }}</td><td>{{ '管理员' if user.role == 'admin' else '普通用户' }}</td><td>{% if user.role != 'admin' %}<form method=\"post\" action=\"/admin/accounts/delete\" onsubmit=\"return confirm('确定删除账号 {{ user.username }} 吗？')\"><input type=\"hidden\" name=\"username\" value=\"{{ user.username }}\"><button class=\"btn danger\" type=\"submit\">删除</button></form>{% else %}系统保留账号{% endif %}</td>",
+    1,
+)
+
 @app.route("/login", methods=["GET", "POST"])
 @app.route("/auth/login", methods=["GET", "POST"])
 def auth_login():
     current = _current_user()
     if current is not None:
-        return redirect("/" if current["role"] == "admin" else "/results")
+        return redirect("/")
     if request.method == "GET":
         return render_template_string(LOGIN_PAGE, error=None)
 
@@ -1475,7 +1847,7 @@ def auth_login():
     session["username"] = user["username"]
     session["auth_session_id"] = new_session_id
     session["role"] = user["role"]
-    return redirect("/" if user["role"] == "admin" else "/results")
+    return redirect("/")
 
 
 @app.route("/auth/logout", methods=["GET", "POST"])
@@ -1492,9 +1864,13 @@ def auth_logout():
 
 
 def _render_accounts(message: str | None = None, status: int = 200):
+    users = auth_store.list_users()
+    for user in users:
+        user["created_at"] = _format_local_time(user["created_at"])
+        user["updated_at"] = _format_local_time(user["updated_at"])
     response = make_response(render_template_string(
-        ADMIN_ACCOUNTS_PAGE,
-        users=auth_store.list_users(),
+        _apply_fixed_navigation(ADMIN_ACCOUNTS_PAGE, "accounts"),
+        users=users,
         current_user=g.current_user,
         message=message,
     ), status)
@@ -1515,15 +1891,18 @@ def create_account():
     if denied:
         return denied
     username = str(request.form.get("username", "")).strip()
+    display_name = str(request.form.get("display_name", "")).strip()
     password = str(request.form.get("password", ""))
     if username.lower() == "admin":
         return _render_accounts("admin 是系统保留管理员账号，不能重复创建。", 400)
     if not re.fullmatch(r"[A-Za-z0-9_\-]{2,32}", username):
         return _render_accounts("账号只能包含字母、数字、下划线或短横线，长度为 2 到 32 位。", 400)
+    if not display_name or len(display_name) > 32:
+        return _render_accounts("中文名不能为空，长度不能超过 32 个字符。", 400)
     if len(password) < 6:
         return _render_accounts("密码长度不能少于 6 位。", 400)
     try:
-        auth_store.create_user(username, password)
+        auth_store.create_user(username, display_name, password)
     except ValueError as exc:
         return _render_accounts(str(exc), 400)
     return _render_accounts(f"账号 {username} 已创建。")
@@ -1545,21 +1924,59 @@ def change_account_password():
     return _render_accounts(f"账号 {username} 的密码已修改。")
 
 
-@app.get("/")
-def index():
+@app.post("/admin/accounts/delete")
+def delete_account():
     denied = _require_admin()
     if denied:
-        return redirect("/results")
-    return render_template_string(PAGE)
+        return denied
+    username = str(request.form.get("username", "")).strip()
+    try:
+        auth_store.delete_user(username)
+    except ValueError as exc:
+        return _render_accounts(str(exc), 400)
+    return _render_accounts(f"账号 {username} 已删除。")
+
+
+@app.get("/")
+@app.get("/workbench")
+def index():
+    return render_template_string(_local_time_page(_build_workbench_page()))
+
+
+@app.get("/console")
+def console_page():
+    denied = _require_admin()
+    if denied:
+        return denied
+    page = PAGE.replace(
+        '<a class="nav-item active" href="/">',
+        '<a class="nav-item" href="/">工作台</a><a class="nav-item active" href="/console">',
+        1,
+    )
+    page = page.replace(
+        "</aside>",
+        '<a class="nav-item" href="/tasks">我的任务</a><a class="nav-item" href="/admin/tasks">全部对接情况</a><a class="nav-item" href="/admin/accounts">账号管理</a></aside>',
+        1,
+    )
+    return render_template_string(_apply_current_user_header(_apply_fixed_navigation(page, "console")))
 
 
 @app.get("/results")
 def results_page():
-    admin_nav = '<a class="nav-item" href="/">采集控制台</a><a class="nav-item" href="/admin/accounts">账号管理</a>' if g.current_user["role"] == "admin" else ""
+    admin_nav = '<a class="nav-item" href="/console">采集控制台</a><a class="nav-item" href="/admin/accounts">账号管理</a>' if g.current_user["role"] == "admin" else ""
     page = RESULTS_PAGE.replace("<!-- ADMIN_CONSOLE_NAV -->", admin_nav)
+    task_nav = '<a class="nav-item" href="/tasks">我的任务</a>'
+    if g.current_user["role"] == "admin":
+        task_nav += '<a class="nav-item" href="/admin/tasks">全部对接情况</a>'
+    page = page.replace("</aside>", task_nav + "</aside>", 1)
+    page = page.replace(
+        "</body>",
+        f"<script>window.currentRole={g.current_user['role']!r}</script></body>",
+        1,
+    )
     page = page.replace(
         '<span class="meta">SQLite indexed storage</span>',
-        f'<span class="meta">当前账号：{g.current_user["username"]}　<a href="/auth/logout">退出系统</a></span>',
+        f'<span class="meta">当前账号：{g.current_user["display_name"]}（{g.current_user["username"]}）　<a href="/auth/logout">退出系统</a></span>',
         1,
     )
     if g.current_user["role"] != "admin":
@@ -1568,28 +1985,200 @@ def results_page():
             '<button class="btn danger" style="display:none" id="deleteBtn"',
             1,
         )
-    return render_template_string(page, current_user=g.current_user)
+    return render_template_string(_local_time_page(_apply_fixed_navigation(page, "results")), current_user=g.current_user)
+
+
+@app.get("/tasks")
+def tasks_page():
+    return render_template_string(_local_time_page(_apply_fixed_navigation(TASKS_PAGE, "tasks")), current_user=g.current_user)
+
+
+@app.get("/tasks/<int:claim_id>")
+def task_detail_page(claim_id: int):
+    task = history_store.get_claim(claim_id, g.current_user["username"])
+    if task is None:
+        return make_response("没有权限访问该任务", 403)
+    return render_template_string(_local_time_page(TASK_DETAIL_PAGE), task=task, current_user=g.current_user)
+
+
+ADMIN_TASKS_PAGE = """
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>全部对接情况</title><style>body{margin:0;background:#f3f5f8;color:#1f2937;font:14px/1.5 "Segoe UI","Microsoft YaHei",sans-serif}.wrap{max-width:1250px;margin:0 auto;padding:28px 20px}.panel{background:#fff;border:1px solid #e5e7eb;border-radius:6px;padding:22px}h1{font-size:22px;margin:0 0 18px}a{color:#2563eb}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:11px;border-bottom:1px solid #e5e7eb;text-align:left;white-space:nowrap}th{background:#f8fafc}td.long{white-space:pre-wrap;min-width:180px}.muted{color:#64748b}</style></head><body><main class="wrap"><p><a href="/results">返回商品列表</a>　<a href="/auth/logout">退出系统</a></p><section class="panel"><h1>全部商家对接情况</h1><div class="table-wrap"><table><thead><tr><th>商品</th><th>商家</th><th>认领账号</th><th>对接情况</th><th>下单要求</th><th>任务额</th><th>创建时间</th></tr></thead><tbody id="rows"></tbody></table><p class="muted" id="empty" hidden>暂无对接记录</p></div></section></main><script>const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));fetch('/api/admin/tasks').then(r=>r.json()).then(items=>{document.getElementById('rows').innerHTML=items.map(i=>'<tr><td>'+esc(i.name||'未命名商品')+'<br><span class="muted">'+esc(i.product_id||i.commodity_id)+'</span></td><td>'+esc(i.shop_name||'-')+'</td><td>'+esc(i.display_name)+'（'+esc(i.username)+'）</td><td>'+esc(i.status)+'</td><td class="long">'+esc(i.order_requirement||'-')+'</td><td>'+Number(i.task_amount||0).toFixed(2)+'</td><td>'+esc(i.created_at).replace('T',' ').slice(0,19)+'</td></tr>').join('');document.getElementById('empty').hidden=items.length>0})</script></body></html>
+"""
+ADMIN_TASKS_PAGE = ADMIN_TASKS_PAGE.replace(
+    "<th>任务额</th>",
+    "<th>本次下单单价</th><th>总单数</th><th>每单下游服务商抽取价</th><th>客户实际付款</th><th>净利润</th>",
+    1,
+).replace(
+    "<td>'+Number(i.task_amount||0).toFixed(2)+'</td>",
+    "<td>'+Number(i.unit_price||0).toFixed(2)+'</td><td>'+Number(i.total_orders||0)+'</td><td>'+Number(i.downstream_unit_cost||0).toFixed(2)+'</td><td>'+Number(i.customer_payment||0).toFixed(2)+'</td><td>'+Number(i.net_profit||0).toFixed(2)+'</td>",
+    1,
+)
+
+
+@app.get("/admin/tasks")
+def admin_tasks_page():
+    denied = _require_admin()
+    if denied:
+        return denied
+    return render_template_string(_local_time_page(_build_admin_tasks_page()), current_user=g.current_user)
 
 
 @app.get("/api/results")
 def results_api():
-    return jsonify(history_store.list_records(
+    contact_filter = request.args.get("has_contact")
+    has_contact = "valid_phone" if contact_filter == "valid_phone" else True if contact_filter == "1" else False if contact_filter == "0" else None
+    records = history_store.list_records(
         limit=request.args.get("limit", 100, type=int),
         offset=request.args.get("offset", 0, type=int),
         query=request.args.get("q"),
         collection_id=request.args.get("collection_id"),
         shop_score_lt=request.args.get("shop_score_lt", type=float),
         month_sale_gt=request.args.get("month_sale_gt", type=float),
-    ))
+        has_contact=has_contact,
+    )
+    claims = history_store.claim_info(item.get("history_id") for item in records)
+    for item in records:
+        claim = claims.get(int(item["history_id"]))
+        item["claim"] = claim
+    return jsonify(records)
+
+
+@app.get("/api/tasks")
+def tasks_api():
+    if g.current_user["role"] == "admin":
+        return jsonify(history_store.list_claimed_products(status=request.args.get("status") or None))
+    return jsonify(history_store.list_claimed_products(g.current_user["username"], request.args.get("status") or None))
+
+
+@app.post("/api/tasks/<int:history_id>/claim")
+def claim_task(history_id: int):
+    if g.current_user["role"] == "admin":
+        return jsonify(ok=False, error="管理员不能认领商品"), 403
+    try:
+        result = history_store.claim_product(history_id, g.current_user["username"], g.current_user["display_name"])
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 409
+    return jsonify(ok=True, **result)
+
+
+@app.delete("/api/tasks/<int:claim_id>")
+def cancel_task(claim_id: int):
+    if g.current_user["role"] == "admin":
+        return jsonify(ok=False, error="管理员没有修改任务权限"), 403
+    try:
+        history_store.cancel_claim(claim_id, g.current_user["username"])
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 403
+    return jsonify(ok=True)
+
+
+@app.get("/api/tasks/<int:claim_id>/liaisons")
+def liaison_list(claim_id: int):
+    task = history_store.get_claim(claim_id, None if g.current_user["role"] == "admin" else g.current_user["username"])
+    if task is None:
+        return jsonify(ok=False, error="任务不存在或无权限"), 403
+    return jsonify(history_store.list_liaison_records(claim_id))
+
+
+@app.post("/api/tasks/<int:claim_id>/liaisons")
+def liaison_create(claim_id: int):
+    if g.current_user["role"] == "admin":
+        return jsonify(ok=False, error="管理员只有查看权限"), 403
+    body = request.get_json(silent=True) or {}
+    try:
+        record = history_store.add_liaison_record(
+            claim_id, g.current_user["username"], str(body.get("status", "")),
+            str(body.get("order_requirement", "")), body.get("unit_price", 0),
+            body.get("total_orders", 0), body.get("downstream_unit_cost", 0),
+        )
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True, record=record)
+
+
+@app.patch("/api/liaisons/<int:record_id>")
+def liaison_financial_update(record_id: int):
+    if g.current_user["role"] == "admin":
+        return jsonify(ok=False, error="管理员只有查看权限"), 403
+    body = request.get_json(silent=True) or {}
+    try:
+        history_store.update_liaison_financials(
+            record_id,
+            g.current_user["username"],
+            body.get("unit_price", 0),
+            body.get("total_orders", 0),
+            body.get("downstream_unit_cost", 0),
+        )
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+    return jsonify(ok=True)
+
+
+@app.delete("/api/liaisons/<int:record_id>")
+def liaison_delete(record_id: int):
+    if g.current_user["role"] == "admin":
+        return jsonify(ok=False, error="管理员只有查看权限"), 403
+    try:
+        history_store.delete_liaison_record(record_id, g.current_user["username"])
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 403
+    return jsonify(ok=True)
+
+
+@app.get("/api/dashboard")
+@app.get("/api/admin/dashboard")
+def admin_dashboard_api():
+    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    end_date = request.args.get("end") or today.isoformat()
+    start_date = request.args.get("start") or (today - timedelta(days=6)).isoformat()
+    try:
+        username = None if g.current_user["role"] == "admin" else g.current_user["username"]
+        return jsonify(history_store.dashboard_stats(start_date, end_date, username=username))
+    except ValueError as exc:
+        return jsonify(ok=False, error=str(exc)), 400
+
+
+@app.get("/api/admin/tasks")
+def admin_tasks_api():
+    denied = _require_admin()
+    if denied:
+        return denied
+    with history_store._connect() as connection:
+        rows = connection.execute(
+            "SELECT h.raw_json, h.id AS history_id, c.id AS claim_id, c.username, c.display_name, c.claimed_at, "
+            "l.status, l.order_requirement, l.unit_price, l.total_orders, l.downstream_unit_cost, "
+            "COALESCE(l.net_profit, l.task_amount, 0) AS net_profit, l.created_at "
+            "FROM liaison_records l JOIN product_claims c ON c.id=l.claim_id JOIN history_records h ON h.id=c.history_id "
+            "ORDER BY l.created_at DESC, l.id DESC"
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = history_store._task_row(row)
+        item.update({
+            "status": row["status"],
+            "order_requirement": row["order_requirement"],
+            "unit_price": row["unit_price"],
+            "total_orders": row["total_orders"],
+            "downstream_unit_cost": row["downstream_unit_cost"],
+            "customer_payment": round(float(row["unit_price"] or 0) * int(row["total_orders"] or 0), 2),
+            "net_profit": row["net_profit"],
+            "task_amount": row["net_profit"],
+            "created_at": row["created_at"],
+        })
+        result.append(item)
+    return jsonify(result)
 
 
 @app.get("/api/results/export")
 def results_export():
+    contact_filter = request.args.get("has_contact")
+    has_contact = "valid_phone" if contact_filter == "valid_phone" else True if contact_filter == "1" else False if contact_filter == "0" else None
     records = history_store.list_all_records(
         query=request.args.get("q"),
         collection_id=request.args.get("collection_id"),
         shop_score_lt=request.args.get("shop_score_lt", type=float),
         month_sale_gt=request.args.get("month_sale_gt", type=float),
+        has_contact=has_contact,
     )
     response = make_response(build_history_workbook(records))
     response.headers["Content-Type"] = (
@@ -1648,6 +2237,7 @@ def collect_selection():
     if denied:
         return denied
     clear_high_sales_filter()
+    reset_selection_page()
     session_id = str(session.get("auth_session_id"))
     try:
         _begin_admin_task(session_id)
@@ -1664,8 +2254,9 @@ def collect_selection():
     except Exception as exc:
         return jsonify(ok=False, error=str(exc)), 500
     finally:
-        _end_admin_task(session_id)
         clear_high_sales_filter()
+        reset_selection_page()
+        _end_admin_task(session_id)
 
 
 @app.get("/login-qr")
@@ -1680,7 +2271,60 @@ def login_qr():
         try:
             if "/account/login" not in page.url:
                 return jsonify(ok=False, error="Current page is not the login page"), 409
-            image = page.screenshot(type="png", full_page=True)
+            qr_area = page.evaluate(
+                """() => {
+                    const selector = [
+                        'img', 'canvas', 'svg',
+                        '[id*="qr" i]', '[class*="qr" i]',
+                        '[id*="qrcode" i]', '[class*="qrcode" i]',
+                        '[data-testid*="qr" i]'
+                    ].join(',');
+                    const candidates = Array.from(new Set(document.querySelectorAll(selector)))
+                        .map(element => {
+                            const rect = element.getBoundingClientRect();
+                            const style = getComputedStyle(element);
+                            const identity = [
+                                element.id || '',
+                                typeof element.className === 'string' ? element.className : '',
+                                element.getAttribute('alt') || '',
+                                element.getAttribute('src') || '',
+                                element.getAttribute('data-testid') || '',
+                                element.textContent || ''
+                            ].join(' ').toLowerCase();
+                            if (style.display === 'none' || style.visibility === 'hidden' ||
+                                rect.width < 80 || rect.height < 80) return null;
+                            const ratio = Math.max(rect.width, rect.height) /
+                                Math.max(1, Math.min(rect.width, rect.height));
+                            const square = ratio <= 1.35;
+                            let score = 0;
+                            if (/qr|qrcode|二维码|扫码/.test(identity)) score += 100;
+                            if (square) score += 40;
+                            if (rect.width <= 600 && rect.height <= 600) score += 20;
+                            if (rect.width > 900 || rect.height > 700) score -= 100;
+                            return {score, rect: {
+                                x: rect.left, y: rect.top,
+                                width: rect.width, height: rect.height
+                            }};
+                        })
+                        .filter(Boolean)
+                        .sort((left, right) => right.score - left.score);
+                    return candidates.length ? candidates[0].rect : null;
+                }"""
+            )
+            if qr_area:
+                padding = max(12, min(qr_area["width"], qr_area["height"]) * 0.12)
+                viewport = page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+                clip_x = max(0, qr_area["x"] - padding)
+                clip_y = max(0, qr_area["y"] - padding)
+                clip = {
+                    "x": clip_x,
+                    "y": clip_y,
+                    "width": min(viewport["width"] - clip_x, qr_area["width"] + padding * 2),
+                    "height": min(viewport["height"] - clip_y, qr_area["height"] + padding * 2),
+                }
+                image = page.screenshot(type="png", clip=clip)
+            else:
+                image = page.screenshot(type="png", full_page=True)
             response = make_response(image)
             response.headers["Content-Type"] = "image/png"
             response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"

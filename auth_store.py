@@ -30,6 +30,7 @@ class AuthStore:
                 """
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL DEFAULT '',
                     password_hash TEXT NOT NULL,
                     role TEXT NOT NULL DEFAULT 'user',
                     active INTEGER NOT NULL DEFAULT 1,
@@ -45,6 +46,14 @@ class AuthStore:
                 );
                 """
             )
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(users)")}
+            if "display_name" not in columns:
+                connection.execute(
+                    "ALTER TABLE users ADD COLUMN display_name TEXT NOT NULL DEFAULT ''"
+                )
+            connection.execute(
+                "UPDATE users SET display_name = username WHERE display_name IS NULL OR display_name = ''"
+            )
             # A process restart means no in-memory collection is still running.
             connection.execute(
                 "UPDATE admin_session SET task_active = 0, task_session_id = NULL WHERE id = 1"
@@ -56,10 +65,10 @@ class AuthStore:
                 now = self._now()
                 connection.execute(
                     """
-                    INSERT INTO users(username, password_hash, role, active, created_at, updated_at)
-                    VALUES (?, ?, 'admin', 1, ?, ?)
+                    INSERT INTO users(username, display_name, password_hash, role, active, created_at, updated_at)
+                    VALUES (?, ?, ?, 'admin', 1, ?, ?)
                     """,
-                    ("admin", generate_password_hash("123456"), now, now),
+                    ("admin", "管理员", generate_password_hash("123456"), now, now),
                 )
 
     @staticmethod
@@ -72,6 +81,7 @@ class AuthStore:
             return None
         return {
             "username": row["username"],
+            "display_name": row["display_name"] or row["username"],
             "role": row["role"],
             "active": bool(row["active"]),
             "created_at": row["created_at"],
@@ -96,20 +106,27 @@ class AuthStore:
             ).fetchone()
         return self._row_to_user(row)
 
-    def create_user(self, username: str, password: str) -> dict[str, Any]:
+    def create_user(self, username: str, display_name: str, password: str) -> dict[str, Any]:
         now = self._now()
         try:
             with self._connect() as connection:
                 connection.execute(
                     """
-                    INSERT INTO users(username, password_hash, role, active, created_at, updated_at)
-                    VALUES (?, ?, 'user', 1, ?, ?)
+                    INSERT INTO users(username, display_name, password_hash, role, active, created_at, updated_at)
+                    VALUES (?, ?, ?, 'user', 1, ?, ?)
                     """,
-                    (username, generate_password_hash(password), now, now),
+                    (username, display_name, generate_password_hash(password), now, now),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError("账号已存在") from exc
-        return {"username": username, "role": "user", "active": True, "created_at": now, "updated_at": now}
+        return {
+            "username": username,
+            "display_name": display_name,
+            "role": "user",
+            "active": True,
+            "created_at": now,
+            "updated_at": now,
+        }
 
     def update_password(self, username: str, password: str) -> None:
         with self._connect() as connection:
@@ -120,10 +137,21 @@ class AuthStore:
             if cursor.rowcount != 1:
                 raise ValueError("账号不存在")
 
+    def delete_user(self, username: str) -> None:
+        if username.lower() == "admin":
+            raise ValueError("不能删除管理员账号")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM users WHERE username = ? AND role = 'user'",
+                (username,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("普通账号不存在")
+
     def list_users(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT username, role, active, created_at, updated_at FROM users ORDER BY username"
+                "SELECT username, display_name, role, active, created_at, updated_at FROM users ORDER BY username"
             ).fetchall()
         return [self._row_to_user(row) for row in rows if row is not None]
 
